@@ -7,6 +7,17 @@
 
 A portable, single-binary MP4 streaming server written in Rust. Streams any size video without memory limits using 256MB chunked streaming. Perfect for media libraries on NAS, local networks, or portable devices.
 
+## 📥 Downloads
+
+| Platform              | File name                                      | Direct link |
+|-----------------------|------------------------------------------------|-------------|
+| macOS Apple Silicon   | theia-v0.2.0-aarch64-apple-darwin              | [Download](https://github.com/weiyou/theia-rust/releases/download/v0.2.0/theia-v0.2.0-aarch64-apple-darwin) |
+| macOS Intel           | theia-v0.2.0-x86_64-apple-darwin               | [Download](https://github.com/weiyou/theia-rust/releases/download/v0.2.0/theia-v0.2.0-x86_64-apple-darwin) |
+| Linux                 | theia-v0.2.0-x86_64-unknown-linux-gnu          | [Download](https://github.com/weiyou/theia-rust/releases/download/v0.2.0/theia-v0.2.0-x86_64-unknown-linux-gnu) |
+| Windows               | theia-v0.2.0-x86_64-pc-windows-msvc.exe        | [Download](https://github.com/weiyou/theia-rust/releases/download/v0.2.0/theia-v0.2.0-x86_64-pc-windows-msvc.exe) |
+
+> **Note**: GitHub does not autodetect your OS — choose the file for your platform.
+
 ## 🚀 Quick Install
 
 ```bash
