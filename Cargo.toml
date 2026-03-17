@@ -1,0 +1,22 @@
+[package]
+name = "theia"
+version = "0.2.0"
+description = "Portable MP4 streaming server with playlist mode"
+authors = ["Wei You"]
+edition = "2024"
+
+[[bin]]
+name = "theia"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+walkdir = "2"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+tower-http = { version = "0.5", features = ["fs"] }
+base64 = "0.21"
+urlencoding = "2.1"
+percent-encoding = "2.3"
+async-stream = "0.3"
