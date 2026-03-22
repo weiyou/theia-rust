@@ -34,10 +34,10 @@ cargo install --git https://github.com/weiyou/theia-rust
 
 ```bash
 # Serve from default ~/Theia_Home directory
-theia-rust
+theia
 
 # Serve from custom directory
-theia-rust --root /path/to/your/videos
+theia --root /path/to/your/videos
 ```
 
 Then open http://localhost:32450 in your browser. Use username `theia` and password `theia`.
@@ -84,7 +84,7 @@ cargo test
 theia-rust/
 ├── src/main.rs          # Complete server implementation
 ├── Cargo.toml           # Dependencies and metadata
-├── docs/implementation_plan.md # Technical documentation
+├── docs/PLAN.md         # Technical documentation
 ├── docs/original-theia.swift # Original Swift implementation
 ├── LICENSE              # MIT license
 └── README.md            # This file
