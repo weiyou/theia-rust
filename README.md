@@ -9,22 +9,13 @@ A portable, single-binary MP4 streaming server written in Rust. Streams any size
 
 ## 📥 Downloads
 
-| Platform              | File name                                      | Direct link |
-|-----------------------|------------------------------------------------|-------------|
-| macOS Apple Silicon   | theia-v0.2.0-aarch64-apple-darwin              | [Download](https://github.com/weiyou/theia-rust/releases/download/v0.2.0/theia-v0.2.0-aarch64-apple-darwin) |
-| macOS Intel           | theia-v0.2.0-x86_64-apple-darwin               | [Download](https://github.com/weiyou/theia-rust/releases/download/v0.2.0/theia-v0.2.0-x86_64-apple-darwin) |
-| Linux                 | theia-v0.2.0-x86_64-unknown-linux-gnu          | [Download](https://github.com/weiyou/theia-rust/releases/download/v0.2.0/theia-v0.2.0-x86_64-unknown-linux-gnu) |
-| Windows               | theia-v0.2.0-x86_64-pc-windows-msvc.exe        | [Download](https://github.com/weiyou/theia-rust/releases/download/v0.2.0/theia-v0.2.0-x86_64-pc-windows-msvc.exe) |
-
-> **Note**: GitHub does not autodetect your OS — choose the file for your platform.
+Download the latest binary from [Releases](https://github.com/weiyou/theia-rust/releases).
 
 ## 🚀 Quick Install
 
 ```bash
 cargo install --git https://github.com/weiyou/theia-rust
 ```
-
-Or download the latest binary from [Releases](https://github.com/weiyou/theia-rust/releases).
 
 ## 🎬 Features
 
