@@ -3,7 +3,7 @@
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{header, HeaderMap, Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode, header},
     middleware::Next,
     response::IntoResponse,
 };
@@ -67,7 +67,7 @@ fn scan_media(root: &PathBuf, prefix: &str) -> MediaNode {
             };
             let child = scan_media(&entry.path().to_path_buf(), &child_prefix);
             children.push(child);
-        } else if entry.path().extension().map_or(false, |ext| ext == "mp4") {
+        } else if entry.path().extension().is_some_and(|ext| ext == "mp4") {
             let rel_path = if prefix.is_empty() {
                 name.clone()
             } else {
@@ -173,19 +173,14 @@ async fn basic_auth_middleware(
     }
 
     let auth_header = req.headers().get("authorization");
-    if let Some(auth) = auth_header {
-        if let Ok(auth_str) = auth.to_str() {
-            if auth_str.starts_with("Basic ") {
-                let base64_part = &auth_str[6..];
-                if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(base64_part) {
-                    if let Ok(credentials) = String::from_utf8(decoded) {
-                        if credentials == "theia:theia" {
-                            return Ok(next.run(req).await);
-                        }
-                    }
-                }
-            }
-        }
+    if let Some(auth) = auth_header
+        && let Ok(auth_str) = auth.to_str()
+        && let Some(base64_part) = auth_str.strip_prefix("Basic ")
+        && let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(base64_part)
+        && let Ok(credentials) = String::from_utf8(decoded)
+        && credentials == "theia:theia"
+    {
+        return Ok(next.run(req).await);
     }
 
     // Return 401 with WWW-Authenticate header
@@ -246,7 +241,7 @@ async fn playall_handler(
         if entry.path() == folder_path {
             continue;
         }
-        if entry.path().is_file() && entry.path().extension().map_or(false, |ext| ext == "mp4") {
+        if entry.path().is_file() && entry.path().extension().is_some_and(|ext| ext == "mp4") {
             let file_name = entry.file_name().to_string_lossy().to_string();
             let rel_path = format!("{}/{}", decoded, file_name);
             mp4s.push(rel_path);
@@ -254,7 +249,7 @@ async fn playall_handler(
     }
 
     // Sort alphanumerically by filename
-    mp4s.sort_by_key(|p| p.split('/').last().unwrap_or("").to_string());
+    mp4s.sort_by_key(|p| p.split('/').next_back().unwrap_or("").to_string());
 
     // Encode paths and build URLs
     let videos: Vec<String> = mp4s
@@ -266,7 +261,11 @@ async fn playall_handler(
         .collect();
 
     // Folder name
-    let folder_name = decoded.split('/').last().unwrap_or("Playlist").to_string();
+    let folder_name = decoded
+        .split('/')
+        .next_back()
+        .unwrap_or("Playlist")
+        .to_string();
 
     // Build JS array for client-side playlist
     let js_array = videos
@@ -327,7 +326,7 @@ async fn stream_handler(
     }
 
     // Check if MP4
-    if full_path.extension().map_or(true, |ext| ext != "mp4") {
+    if full_path.extension().is_none_or(|ext| ext != "mp4") {
         return (StatusCode::NOT_FOUND, "File is not an MP4").into_response();
     }
 
@@ -339,7 +338,7 @@ async fn stream_handler(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to read file metadata: {}", e),
             )
-                .into_response()
+                .into_response();
         }
     };
     let file_size = metadata.len();
@@ -353,43 +352,38 @@ async fn stream_handler(
     headers_resp.insert(header::CONTENT_TYPE, "video/mp4".parse().unwrap());
     headers_resp.insert("Accept-Ranges", "bytes".parse().unwrap());
 
-    let (start_byte, end_byte) = if let Some(range_header) = headers.get("range") {
-        if let Ok(range_str) = range_header.to_str() {
-            if range_str.starts_with("bytes=") {
-                let ranges: Vec<&str> = range_str[6..].split('-').collect();
-                let start = ranges[0].parse::<u64>().unwrap_or(0);
-                let end = if ranges.len() > 1 && !ranges[1].is_empty() {
-                    ranges[1].parse::<u64>().unwrap_or(file_size - 1)
-                } else {
-                    file_size - 1
-                };
-
-                if start >= file_size || end >= file_size || start > end {
-                    return (
-                        StatusCode::RANGE_NOT_SATISFIABLE,
-                        "Requested range is invalid",
-                    )
-                        .into_response();
-                }
-
-                status = StatusCode::PARTIAL_CONTENT;
-                headers_resp.insert(
-                    "Content-Range",
-                    format!("bytes {}-{}/{}", start, end, file_size)
-                        .parse()
-                        .unwrap(),
-                );
-                headers_resp.insert(
-                    header::CONTENT_LENGTH,
-                    (end - start + 1).to_string().parse().unwrap(),
-                );
-                (start, end)
-            } else {
-                (0, file_size - 1)
-            }
+    let (start_byte, end_byte) = if let Some(range_header) = headers.get("range")
+        && let Ok(range_str) = range_header.to_str()
+        && let Some(stripped) = range_str.strip_prefix("bytes=")
+    {
+        let ranges: Vec<&str> = stripped.split('-').collect();
+        let start = ranges[0].parse::<u64>().unwrap_or(0);
+        let end = if ranges.len() > 1 && !ranges[1].is_empty() {
+            ranges[1].parse::<u64>().unwrap_or(file_size - 1)
         } else {
-            (0, file_size - 1)
+            file_size - 1
+        };
+
+        if start >= file_size || end >= file_size || start > end {
+            return (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "Requested range is invalid",
+            )
+                .into_response();
         }
+
+        status = StatusCode::PARTIAL_CONTENT;
+        headers_resp.insert(
+            "Content-Range",
+            format!("bytes {}-{}/{}", start, end, file_size)
+                .parse()
+                .unwrap(),
+        );
+        headers_resp.insert(
+            header::CONTENT_LENGTH,
+            (end - start + 1).to_string().parse().unwrap(),
+        );
+        (start, end)
     } else {
         headers_resp.insert(
             header::CONTENT_LENGTH,
@@ -403,17 +397,16 @@ async fn stream_handler(
         let mut file = match tokio::fs::File::open(&full_path).await {
             Ok(f) => f,
             Err(e) => {
-                yield Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to open file: {}", e)));
+                yield Err(std::io::Error::other(format!("Failed to open file: {}", e)));
                 return;
             }
         };
 
-        if start_byte > 0 {
-            if let Err(e) = file.seek(std::io::SeekFrom::Start(start_byte)).await {
-                yield Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to seek file: {}", e)));
+        if start_byte > 0
+            && let Err(e) = file.seek(std::io::SeekFrom::Start(start_byte)).await {
+                yield Err(std::io::Error::other(format!("Failed to seek file: {}", e)));
                 return;
             }
-        }
 
         let mut remaining = (end_byte - start_byte + 1) as usize;
         while remaining > 0 {
@@ -425,7 +418,7 @@ async fn stream_handler(
                     remaining -= chunk_size;
                 }
                 Err(e) => {
-                    yield Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to read file chunk: {}", e)));
+                    yield Err(std::io::Error::other(format!("Failed to read file chunk: {}", e)));
                     return;
                 }
             }
