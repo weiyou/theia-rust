@@ -1,4 +1,4 @@
-**Cline Instruction**: Before ANY /act or /deep-planning, always read and strictly follow @docs/implementation_plan.md. This is the living architecture document. Never deviate without updating it first.
+**Cline Instruction**: Before ANY /act or /deep-planning, always read and strictly follow @docs/PLAN.md. This is the living architecture document. Never deviate without updating it first.
 
 # Implementation Plan - Current State & Future Features
 
