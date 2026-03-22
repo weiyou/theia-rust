@@ -1,9 +1,10 @@
 [package]
 name = "theia"
-version = "0.2.0"
+version = "0.2.1"
 description = "Portable MP4 streaming server with playlist mode"
 authors = ["Wei You"]
 edition = "2024"
+rust-version = "1.85"
 
 [[bin]]
 name = "theia"
