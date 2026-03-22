@@ -1,5 +1,3 @@
-**Cline Instruction**: Before ANY /act or /deep-planning, always read and strictly follow @docs/implementation_plan.md. This is the living architecture document. Never deviate without updating it first.
-
 # Theia Rust
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)](https://www.rust-lang.org/)
