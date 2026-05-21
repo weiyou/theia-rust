@@ -81,6 +81,7 @@ ffprobe = "ffprobe"
 # cache_dir = "/path/to/cache"      # default: OS cache dir /theia/hls
 cache_max_gb = 20.0                 # LRU cap for transcoded HLS segments
 encoder = "h264_videotoolbox"       # or "libx264" for better compression
+max_concurrent_transcodes = 2       # limit parallel ffmpeg jobs (P1 safeguard)
 extensions = ["mp4", "m4v", "mov", "webm", "mkv", "avi", "ts", "flv"]
 ```
 

@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore, OwnedSemaphorePermit};
 
 const SEGMENT_SECONDS: u32 = 6;
 /// Kill a transcode session that has had no requests for this long.
@@ -37,6 +37,9 @@ struct Session {
     /// Held so the process is killed on drop (`kill_on_drop`).
     _child: Child,
     last_access: Instant,
+    /// Keeps the concurrency slot reserved for the lifetime of this transcode.
+    /// Dropped when the session is reaped or the server shuts down.
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 /// Lightweight manifest stored alongside each cached HLS directory.
@@ -59,14 +62,19 @@ pub struct TranscodeManager {
     config: Arc<Config>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     probe_cache: ProbeCache,
+    /// Limits how many ffmpeg transcodes may run concurrently.
+    /// Uses OwnedSemaphorePermit stored in each active Session.
+    semaphore: Arc<Semaphore>,
 }
 
 impl TranscodeManager {
     pub fn new(config: Arc<Config>, probe_cache: ProbeCache) -> Self {
+        let permits = config.max_concurrent_transcodes.max(1);
         Self {
-            config,
+            config: config.clone(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             probe_cache,
+            semaphore: Arc::new(Semaphore::new(permits)),
         }
     }
 }
@@ -190,7 +198,7 @@ async fn serve_playlist(state: &AppState, file: &StdPath) -> Response {
         } else {
             // Either no cache, or we just invalidated a stale one. Start fresh
             // while still holding the lock to avoid double-spawn.
-            match start_session(&mgr.config, &mgr.probe_cache, file, &dir).await {
+            match start_session(mgr, file, &dir).await {
                 Ok(session) => {
                     sessions.insert(key.clone(), session);
                 }
@@ -261,14 +269,22 @@ async fn serve_segment(state: &AppState, file: &StdPath, seg: &str) -> Response 
     }
 }
 
-/// Probe the source, create the cache dir, write a source manifest, and spawn
-/// the ffmpeg HLS process. The manifest enables reliable stale-cache detection.
+/// Probe the source, create the cache dir, write a source manifest, acquire a
+/// concurrency permit, and spawn the ffmpeg HLS process.
 async fn start_session(
-    config: &Config,
-    probe_cache: &ProbeCache,
+    mgr: &TranscodeManager,
     file: &StdPath,
     dir: &StdPath,
 ) -> std::io::Result<Session> {
+    let config = &mgr.config;
+    let probe_cache = &mgr.probe_cache;
+
+    // Acquire a concurrency slot *before* doing heavy work (mkdir, probe, spawn).
+    // This may queue if we are already at the configured limit.
+    // The permit is stored in the Session and released on drop / reaping.
+    let permit = mgr.semaphore.clone().acquire_owned().await
+        .map_err(|_| std::io::Error::other("transcode semaphore closed"))?;
+
     // Capture full probe data (for manifest) + height for bitrate selection.
     let probe_data = probe::probe(&config.ffprobe, file, probe_cache).await;
     let height = probe_data.as_ref().map(|p| p.height).unwrap_or(0);
@@ -352,6 +368,7 @@ async fn start_session(
         dir: dir.to_path_buf(),
         _child: child,
         last_access: Instant::now(),
+        _permit: Some(permit),
     })
 }
 

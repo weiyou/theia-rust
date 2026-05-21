@@ -43,6 +43,7 @@ struct FileConfig {
     cache_max_gb: f64,
     encoder: String,
     extensions: Vec<String>,
+    max_concurrent_transcodes: usize,
 }
 
 impl Default for FileConfig {
@@ -61,6 +62,7 @@ impl Default for FileConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            max_concurrent_transcodes: 2,
         }
     }
 }
@@ -78,6 +80,9 @@ pub struct Config {
     pub cache_max_bytes: u64,
     pub encoder: String,
     pub extensions: Vec<String>,
+    /// Maximum number of concurrent ffmpeg transcodes allowed.
+    /// Additional requests queue (fairly) until a slot is free. Default: 2.
+    pub max_concurrent_transcodes: usize,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
 }
@@ -129,6 +134,7 @@ impl Config {
             cache_max_bytes: (file.cache_max_gb * 1024.0 * 1024.0 * 1024.0) as u64,
             encoder: file.encoder,
             extensions: file.extensions.iter().map(|e| e.to_lowercase()).collect(),
+            max_concurrent_transcodes: file.max_concurrent_transcodes,
             tls_cert: args.tls_cert,
             tls_key: args.tls_key,
         }
