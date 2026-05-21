@@ -22,6 +22,7 @@ use std::path::{Path as StdPath, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
@@ -36,6 +37,21 @@ struct Session {
     /// Held so the process is killed on drop (`kill_on_drop`).
     _child: Child,
     last_access: Instant,
+}
+
+/// Lightweight manifest stored alongside each cached HLS directory.
+/// Used for stale-cache detection (P0) and as a foundation for future
+/// smarter features (segment-on-demand, better eviction, etc.).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CacheManifest {
+    /// Unix timestamp seconds of the source file's mtime at transcode time.
+    source_mtime_unix: u64,
+    source_size: u64,
+    duration: f64,
+    width: u32,
+    height: u32,
+    vcodec: String,
+    acodec: String,
 }
 
 #[derive(Clone)]
@@ -104,22 +120,76 @@ fn is_segment_name(seg: &str) -> bool {
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// Load a cache manifest if present (returns None for old caches without one).
+async fn load_manifest(dir: &StdPath) -> Option<CacheManifest> {
+    let path = dir.join("manifest.json");
+    let bytes = tokio::fs::read(&path).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Write (or overwrite) the manifest for a cache directory.
+async fn write_manifest(dir: &StdPath, m: &CacheManifest) -> std::io::Result<()> {
+    let path = dir.join("manifest.json");
+    let data = serde_json::to_vec_pretty(m)?;
+    tokio::fs::write(path, data).await
+}
+
+/// Return true if the live source file still matches the manifest we captured
+/// when we originally transcoded it.
+async fn source_matches_manifest(file: &StdPath, m: &CacheManifest) -> bool {
+    let meta = match tokio::fs::metadata(file).await {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let mtime = match meta.modified() {
+        Ok(t) => t
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        Err(_) => return false,
+    };
+    mtime == m.source_mtime_unix && meta.len() == m.source_size
+}
+
+/// If a completed cache exists for this file, validate that the source has not
+/// changed since we built the transcode. Returns `true` if we can safely serve
+/// the cached playlist. On mismatch (or missing/invalid manifest) the directory
+/// is removed so the caller will fall through to starting a fresh session.
+async fn validate_cached_transcode(
+    file: &StdPath,
+    dir: &StdPath,
+    playlist: &StdPath,
+) -> bool {
+    if !playlist.exists() {
+        return false;
+    }
+    match load_manifest(dir).await {
+        Some(m) if source_matches_manifest(file, &m).await => true,
+        _ => {
+            // Stale, missing manifest (old cache), or source changed → blow it away.
+            let _ = tokio::fs::remove_dir_all(dir).await;
+            false
+        }
+    }
+}
+
 async fn serve_playlist(state: &AppState, file: &StdPath) -> Response {
     let mgr = &state.transcoder;
     let key = key_for(file);
     let dir = mgr.config.cache_dir.join(&key);
     let playlist = dir.join("index.m3u8");
 
-    // Fast path: an existing session (or a completed cache) already has the playlist.
+    // Fast path: an existing session (or a validated completed cache) already has the playlist.
     {
         let mut sessions = mgr.sessions.lock().await;
         if let Some(session) = sessions.get_mut(&key) {
             session.last_access = Instant::now();
-        } else if playlist.exists() {
-            // Completed transcode from a previous run — serve from cache, no respawn.
+        } else if validate_cached_transcode(file, &dir, &playlist).await {
+            // Completed transcode from a previous run and the source file has not changed.
             return read_playlist(&playlist).await;
         } else {
-            // Start a new session while holding the lock to avoid double-spawn.
+            // Either no cache, or we just invalidated a stale one. Start fresh
+            // while still holding the lock to avoid double-spawn.
             match start_session(&mgr.config, &mgr.probe_cache, file, &dir).await {
                 Ok(session) => {
                     sessions.insert(key.clone(), session);
@@ -191,22 +261,49 @@ async fn serve_segment(state: &AppState, file: &StdPath, seg: &str) -> Response 
     }
 }
 
-/// Probe the source, create the cache dir, and spawn the ffmpeg HLS process.
+/// Probe the source, create the cache dir, write a source manifest, and spawn
+/// the ffmpeg HLS process. The manifest enables reliable stale-cache detection.
 async fn start_session(
     config: &Config,
     probe_cache: &ProbeCache,
     file: &StdPath,
     dir: &StdPath,
 ) -> std::io::Result<Session> {
-    let height = probe::probe(&config.ffprobe, file, probe_cache)
-        .await
-        .map(|p| p.height)
-        .unwrap_or(0);
+    // Capture full probe data (for manifest) + height for bitrate selection.
+    let probe_data = probe::probe(&config.ffprobe, file, probe_cache).await;
+    let height = probe_data.as_ref().map(|p| p.height).unwrap_or(0);
     let bitrate = bitrate_for(height);
+
+    // Source metadata for the manifest (mtime + size).
+    let source_meta = tokio::fs::metadata(file).await.ok();
+    let source_mtime_unix = source_meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let source_size = source_meta.as_ref().map(|m| m.len()).unwrap_or(0);
 
     // Fresh directory so a stale/partial playlist never confuses the player.
     let _ = tokio::fs::remove_dir_all(dir).await;
     tokio::fs::create_dir_all(dir).await?;
+
+    // Write the manifest *before* starting ffmpeg so that even a partial
+    // failure leaves a traceable record for future invalidation logic.
+    if let Some(p) = &probe_data {
+        let manifest = CacheManifest {
+            source_mtime_unix,
+            source_size,
+            duration: p.duration,
+            width: p.width,
+            height: p.height,
+            vcodec: p.vcodec.clone(),
+            acodec: p.acodec.clone(),
+        };
+        // Best-effort; failure to write the manifest is non-fatal for now
+        // (old behavior is preserved for caches without a manifest).
+        let _ = write_manifest(dir, &manifest).await;
+    }
 
     let log = std::fs::File::create(dir.join("ffmpeg.log"))?;
 
@@ -342,7 +439,8 @@ async fn dir_size(dir: &StdPath) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{bitrate_for, is_segment_name};
+    use super::{bitrate_for, is_segment_name, load_manifest, write_manifest, CacheManifest, validate_cached_transcode};
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn segment_names_are_strictly_validated() {
@@ -363,5 +461,56 @@ mod tests {
         assert_eq!(bitrate_for(1080), "6M");
         assert_eq!(bitrate_for(720), "3M");
         assert_eq!(bitrate_for(360), "900k");
+    }
+
+    #[tokio::test]
+    async fn manifest_roundtrips_and_detects_stale_source() {
+        let tmp = std::env::temp_dir().join(format!("theia_manifest_test_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let src_file = tmp.join("source.mp4");
+        tokio::fs::write(&src_file, b"initial-content").await.unwrap();
+
+        // Simulate what start_session does.
+        let mtime = tokio::fs::metadata(&src_file)
+            .await
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let manifest = CacheManifest {
+            source_mtime_unix: mtime,
+            source_size: 15,
+            duration: 12.3,
+            width: 640,
+            height: 480,
+            vcodec: "vp9".into(),
+            acodec: "opus".into(),
+        };
+
+        write_manifest(&tmp, &manifest).await.unwrap();
+        let loaded = load_manifest(&tmp).await.unwrap();
+        assert_eq!(loaded.source_size, 15);
+        assert_eq!(loaded.vcodec, "vp9");
+
+        // validate should succeed while source is unchanged
+        let playlist = tmp.join("index.m3u8");
+        tokio::fs::write(&playlist, "#EXTM3U\nseg-00000.ts\n").await.unwrap();
+        assert!(validate_cached_transcode(&src_file, &tmp, &playlist).await);
+
+        // Now mutate the source (size changes → must be treated as stale).
+        // We rely on size mismatch (the mtime check is a defense-in-depth).
+        tokio::fs::write(&src_file, b"this-is-a-much-longer-replacement-that-changes-size-and-mtime").await.unwrap();
+
+        // After mutation, the cache should be considered stale and the dir removed.
+        let still_valid = validate_cached_transcode(&src_file, &tmp, &playlist).await;
+        assert!(!still_valid, "stale source must cause invalidation");
+        assert!(!tmp.exists() || !playlist.exists(), "stale cache dir should have been removed");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 }

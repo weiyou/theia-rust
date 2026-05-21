@@ -107,6 +107,9 @@ cargo build --release
 cargo test
 ```
 
+For the full manual verification matrix (including the new P0 stale-cache behavior and HLS end-to-end),
+see the **✅ Verification** section above. `cargo test` now also covers the manifest round-trip and
+invalidation logic added after the v0.3 evaluation.
 ### Project Structure
 
 ```
@@ -138,6 +141,51 @@ theia-rust/
 - `GET /hls/{enc}/index.m3u8` - On-demand HLS playlist (starts/attaches a transcode)
 - `GET /hls/{enc}/seg-NNNNN.ts` - Transcoded HLS segment
 - `GET /playall/{enc}` - Auto-play (direct-stream) playlist for a folder
+
+## ✅ Verification
+
+### Automated Tests
+```bash
+cargo test
+```
+This covers path safety, segment name validation, bitrate ladder, and (since the v0.3 evaluation)
+the new P0 cache manifest + stale source invalidation logic in `transcode.rs`.
+
+### Manual End-to-End Matrix (recommended before releases)
+
+Use a clean `~/Theia_Home` (or `--root /tmp/theia-test`) and `ffmpeg` on PATH.
+
+1. **Happy Path (core feature)**
+   - Add a short VP9, AV1, or Opus-containing file.
+   - Visit `http://localhost:32450`, authenticate (`theia`/`theia` by default).
+   - Click the **▶ H264/AAC** button on a non-H.264 file.
+   - Verify: Safari/iOS plays the HLS stream, audio works, video is H.264 High (check stats or `ffprobe` on a captured segment), seeking within the already-produced prefix works.
+   - Second load of the same file is instant (cached playlist, no new ffmpeg).
+
+2. **Cache Invalidation (P0 fix, issue #3)**
+   - Let a transcode complete (manifest.json + segments written in `~/.cache/theia/hls/<hash>`).
+   - Replace the source in-place: `cp new-version.mkv original.mkv` (or edit content + `touch`).
+   - Reload the H264/AAC player for that file.
+   - Expected: old cache is removed, a fresh transcode starts (new manifest with updated mtime/size).
+
+3. **Seeking & Long-Form Behavior**
+   - Use a longer source (> 10 min).
+   - Play, then seek far forward (e.g. 80%).
+   - Note the buffering time — this demonstrates the current linear "event" playlist limitation (ffmpeg must reach that point). See issue #6 for the planned segment-on-demand improvement.
+
+4. **Lifecycle & Resources**
+   - Start several H264/AAC transcodes.
+   - Stop watching → after ~120 s idle, `ps | grep ffmpeg` should show the processes reaped.
+   - Fill the cache past `cache_max_gb` (or set it low) → the sweeper should evict oldest completed directories while protecting active sessions.
+
+5. **Safety**
+   - Try `../../etc/passwd` or malicious segment names (`seg-../../../etc/passwd.ts`) → rejected (400/404, no escape).
+   - Wrong Basic Auth → 401 with `WWW-Authenticate`.
+
+6. **Error Cases**
+   - Feed a corrupt or stream-less file → useful(ish) error surfaced; `ffmpeg.log` inside the (now-invalidated) cache dir contains the real ffmpeg output.
+
+See GitHub issues #3–#7 and `docs/PLAN.md` for the full post-evaluation findings and roadmap.
 
 ## 🔧 Configuration
 
@@ -173,9 +221,15 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🔮 Future Features
 
-See [PLAN.md](docs/PLAN.md) for the living architecture document and planned enhancements
-including:
-- Segment-on-demand transcoding for instant arbitrary seeking
-- File upload, search, and bulk operations
-- Per-folder "Play All" via transcoded HLS
+See [PLAN.md](docs/PLAN.md) for the living architecture document (updated after the
+v0.3 HLS transcoding evaluation) and the full roadmap. Key follow-up work is tracked
+in GitHub issues:
+- [#3](https://github.com/weiyou/theia-rust/issues/3) — P0 stale cache invalidation + source manifest (completed in this prototype)
+- [#6](https://github.com/weiyou/theia-rust/issues/6) — Segment-on-demand for instant arbitrary seeking
+- [#4](https://github.com/weiyou/theia-rust/issues/4), [#5](https://github.com/weiyou/theia-rust/issues/5), [#7](https://github.com/weiyou/theia-rust/issues/7) — concurrency limits, error visibility, and testing/CI improvements
+
+Planned enhancements also include:
+- Transcoded "Play All" for folders
+- Smarter per-file "Play" vs "H264/AAC" buttons using probe data
+- File upload / search / bulk operations
 - And more!

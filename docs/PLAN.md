@@ -5,12 +5,20 @@
 [Overview]
 Theia is a portable media streaming server in Rust (Axum + Tokio). It serves a directory of
 media files with a browsable HTML tree, constant-memory byte-range streaming, a per-folder
-"Play All" playlist, and basic auth. Its headline capability is **on-demand transcoding**:
+"Play All" playlist, and basic auth. Its headline capability (landed in v0.3 on the
+`feat/theia-hls-transcoding` branch) is **on-demand transcoding**:
 a per-file **H264/AAC** button transcodes any source (notably VP9/AV1/Opus) to H.264/AAC and
 delivers it as **HLS**, which Safari plays natively with seeking. This is what lets
 VP9/AV1 content play on devices without VP9/AV1 hardware decode (e.g. a 2nd-gen iPad Pro).
 Transcoding shells out to `ffmpeg`/`ffprobe`; on Apple Silicon it uses the
 `h264_videotoolbox` hardware encoder, which runs faster than realtime.
+
+> **2026 Evaluation Note**: A full code review of the v0.3 transcoding implementation
+> (Grok 4.3) is captured in the session plan and resulted in GitHub issues #3–#7.
+> The current design uses a linear "event" playlist (one ffmpeg from t=0 per file).
+> This delivers excellent "play from start" UX but has known limitations for arbitrary
+> seeking on long files and cache invalidation. See the new "Current Status & Known Gaps"
+> section below.
 
 [Architecture / Files]
 Code is split into focused modules under `src/`:
@@ -52,7 +60,17 @@ ffmpeg writes an `event` HLS playlist + TS segments to `cache_dir/<hash>/`:
 `-c:v <encoder> -profile:v high -b:v <bitrate-by-height> -tag:v avc1 -c:a aac -b:a 160k
 -ac 2 -f hls -hls_time 6 -hls_flags independent_segments -hls_playlist_type event`.
 Playlist requests poll until the first `.ts` appears; segments are served from the cache dir
-(name strictly validated). Hardware encode outpaces playback, so seeking works in practice.
+(name strictly validated).
+
+**Known limitation (v0.3)**: This is a *linear* transcode from t=0. The playlist only
+contains segments that ffmpeg has already produced. Seeking works well within the
+already-transcoded prefix (especially with fast HW encoding), but arbitrary seeks on
+long files may require waiting for ffmpeg to reach that point. True segment-on-demand
+is tracked as a future increment (see issues and roadmap below).
+
+A lightweight `manifest.json` (source mtime/size + probe data) is being added as part
+of the P0 cache-correctness work so that stale transcodes are invalidated when the
+source file changes.
 
 [Dependencies]
 axum, tokio (full), walkdir, clap, dirs, base64, urlencoding, async-stream, serde,
@@ -61,20 +79,60 @@ Optional `tls` feature: axum-server (tls-rustls). Runtime: ffmpeg + ffprobe on P
 
 [Testing]
 Unit tests: path encode/decode + traversal containment (`scan.rs`), segment-name validation
-and bitrate selection (`transcode.rs`). Manual end-to-end verified with generated
-VP9/AV1/H264 samples (listing, /meta, range, /hls playlist+segment codecs, traversal block,
-HTTPS). See README "Verification".
+and bitrate selection (`transcode.rs`).
 
-## Next Possible Features (Priority Order)
+The HLS transcoding paths currently have only manual verification (generated VP9/AV1/H264
+samples exercising listing, /meta, /hls playlist+segments, seeking within produced prefix,
+traversal safety, and HTTPS). See the new "Verification" section being added to README.md
+and the related GitHub issue for adding automated smoke/integration coverage that exercises
+ffmpeg. A full evaluation of the v0.3 transcoding implementation (including gaps) lives in
+the session plan for the feature branch.
 
-1. **Segment-on-demand transcoding**: compute a VOD playlist from duration up front and
-   transcode each requested segment with `-ss`, for instant arbitrary seeking on huge files.
-2. **Transcoded "Play All"**: switch the folder playlist to per-file HLS so incompatible
-   codecs auto-play in sequence on the iPad.
-3. **Smart default button**: use `Probe::ipad_native()` to label the button (Play vs
-   Transcode) per file.
-4. **File upload / deletion / rename / move**: write operations with confirmation.
-5. **Search & sorting**: `/search?q=` and sort query params.
-6. **Pagination** for very large directories.
-7. **Rate limiting** and richer structured logging.
-8. **Bulk operations**: multi-select batch actions.
+## Current Status & Known Gaps (Post-v0.3 Evaluation)
+
+The `feat/theia-hls-transcoding` branch successfully delivered the core "H264/AAC button"
+experience. A detailed code review (Grok 4.3, 2026) identified one **critical correctness bug**
+and several robustness/UX gaps. Work is tracked in the following GitHub issues:
+
+- **#3 (P0 — Critical)**: Stale HLS transcode cache on source file replacement / mtime change.
+  The cache must be invalidated when the source changes (add `manifest.json` with mtime/size + probe data).
+- **#4 (P1)**: No limit on concurrent transcodes → resource exhaustion risk on NAS / multi-user.
+- **#5 (P1)**: Transcode errors are opaque (no way to surface `ffmpeg.log` or actionable messages).
+- **#6 (P2 / Architecture)**: Segment-on-demand transcoding for instant arbitrary seeking on long files
+  (elevated from the pre-existing roadmap item below).
+- **#7**: Testing, CI, and docs gaps for the transcoding feature (integration coverage, PR smoke jobs,
+  reproducible verification steps in README).
+
+See the session evaluation plan for the full analysis, repro steps, and recommended implementation order.
+
+## Next Possible Features (Living Roadmap)
+
+### High-Priority Transcoding Evolution
+1. **Segment-on-demand transcoding** (see #6): Compute a VOD playlist from probed duration up front and
+   transcode each requested segment (or small window) with `-ss` / `-to` for instant arbitrary seeking
+   on huge files. Consider a hybrid mode (event for "play from start", per-segment for seeks).
+2. **Cache correctness + manifest** (#3): Lightweight `manifest.json` per cache dir (source mtime, size,
+   duration, key streams, encoder used). Use it for invalidation, smarter eviction, and future features.
+
+### UX Polish
+3. **Transcoded "Play All"**: Switch the folder playlist to per-file HLS so incompatible codecs
+   auto-play in sequence on the iPad (and other limited clients).
+4. **Smart default button**: Use `Probe::ipad_native()` to label the button ("▶ Play" vs "▶ H264/AAC")
+   and choose the default action per file.
+
+### Platform & Operations
+5. **Concurrent transcode limiting + backpressure** (#4): `max_concurrent_transcodes` config + semaphore.
+6. **Better error observability** (#5): Expose `ffmpeg.log` via `/hls/{enc}/ffmpeg.log`, surface useful
+   messages on failure, structured tracing events for session lifecycle.
+7. **Improved cache LRU**: Persisted last-access tracking instead of (or in addition to) filesystem
+   atime/mtime for more reliable eviction of completed transcodes.
+
+### General Features
+8. **File upload / deletion / rename / move**: Write operations with confirmation.
+9. **Search & sorting**: `/search?q=` and sort query params.
+10. **Pagination** for very large directories.
+11. **Rate limiting** and richer structured logging / admin status page.
+12. **Bulk operations**: multi-select batch actions.
+
+See the individual GitHub issues for detailed acceptance criteria and design sketches. The P0 item
+(#3) should be completed before any wider v0.3.x release on real media libraries.
