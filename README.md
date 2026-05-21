@@ -141,6 +141,7 @@ theia-rust/
 - `GET /play/{enc}` - Player page that plays the file as transcoded H.264/AAC HLS
 - `GET /hls/{enc}/index.m3u8` - On-demand HLS playlist (starts/attaches a transcode)
 - `GET /hls/{enc}/seg-NNNNN.ts` - Transcoded HLS segment
+- `GET /status` - JSON status of active transcodes and concurrency limit (auth required)
 - `GET /playall/{enc}` - Auto-play (direct-stream) playlist for a folder
 
 ## ✅ Verification
@@ -196,6 +197,7 @@ See GitHub issues #3–#7 and `docs/PLAN.md` for the full post-evaluation findin
 - `--config <PATH>` - Config file path (default: ~/.config/theia/config.toml)
 - `--port <PORT>` - Listen port (default: 32450)
 - `--tls-cert <PATH>` / `--tls-key <PATH>` - PEM cert/key (requires `--features tls`)
+- `--max-transcodes <N>` - Maximum concurrent transcodes (overrides config). Default: 2
 - `--help` - Show help information
 
 ### Environment Variables

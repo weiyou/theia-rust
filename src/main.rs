@@ -61,6 +61,7 @@ async fn main() {
         .route("/playall/:enc", get(listing::playall_handler))
         .route("/stream/:enc", get(stream::stream_handler))
         .route("/hls/:enc/:seg", get(transcode::hls_handler))
+        .route("/status", get(transcode::status_handler))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::basic_auth_middleware,

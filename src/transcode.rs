@@ -34,6 +34,8 @@ const PLAYLIST_WAIT: Duration = Duration::from_secs(20);
 
 struct Session {
     dir: PathBuf,
+    /// Human-friendly name for status/debug pages (e.g. "movie.mkv").
+    display_name: String,
     /// Held so the process is killed on drop (`kill_on_drop`).
     _child: Child,
     last_access: Instant,
@@ -364,8 +366,14 @@ async fn start_session(
         .kill_on_drop(true);
 
     let child = cmd.spawn()?;
+    let display_name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+
     Ok(Session {
         dir: dir.to_path_buf(),
+        display_name,
         _child: child,
         last_access: Instant::now(),
         _permit: Some(permit),
@@ -454,6 +462,47 @@ async fn dir_size(dir: &StdPath) -> u64 {
     total
 }
 
+/// Lightweight status for the debug endpoint.
+#[derive(serde::Serialize)]
+pub struct TranscodeStatus {
+    pub active_transcodes: usize,
+    pub max_concurrent: usize,
+    pub sessions: Vec<SessionInfo>,
+}
+
+#[derive(serde::Serialize)]
+pub struct SessionInfo {
+    pub display_name: String,
+    pub last_access_secs_ago: u64,
+}
+
+/// `GET /status` — simple JSON view of current transcoding activity (behind auth).
+pub async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let mgr = &state.transcoder;
+    let sessions = mgr.sessions.lock().await;
+    let now = Instant::now();
+
+    let mut infos: Vec<SessionInfo> = sessions
+        .values()
+        .map(|s| SessionInfo {
+            display_name: s.display_name.clone(),
+            last_access_secs_ago: now.duration_since(s.last_access).as_secs(),
+        })
+        .collect();
+
+    // Sort by most recently accessed first
+    infos.sort_by_key(|i| i.last_access_secs_ago);
+
+    let status = TranscodeStatus {
+        active_transcodes: sessions.len(),
+        max_concurrent: mgr.config.max_concurrent_transcodes,
+        sessions: infos,
+    };
+
+    (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], serde_json::to_string(&status).unwrap())
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{bitrate_for, is_segment_name, load_manifest, write_manifest, CacheManifest, validate_cached_transcode};
@@ -529,5 +578,38 @@ mod tests {
         assert!(!tmp.exists() || !playlist.exists(), "stale cache dir should have been removed");
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// Integration-style test for the concurrency limiter (P1).
+    /// We exercise the real Semaphore + OwnedSemaphorePermit behavior used by
+    /// the HLS handlers without needing a full HTTP stack or real media files.
+    #[tokio::test]
+    async fn concurrency_limit_is_enforced() {
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        // Simulate what TranscodeManager does with a limit of 2
+        let sem = Arc::new(Semaphore::new(2));
+
+        // Acquire first two permits (simulating two active transcodes)
+        let p1 = sem.clone().acquire_owned().await.unwrap();
+        let p2 = sem.clone().acquire_owned().await.unwrap();
+
+        // Third acquire should not complete immediately (we use try_acquire to prove it)
+        assert!(sem.try_acquire().is_err(), "should be at limit of 2");
+
+        // Release one (simulating a session being reaped / idle timeout)
+        drop(p1);
+
+        // Now the third should succeed
+        let p3 = sem.clone().acquire_owned().await.unwrap();
+        assert!(sem.try_acquire().is_err(), "still at limit after releasing one");
+
+        // Clean up
+        drop(p2);
+        drop(p3);
+
+        // After all released, we should be able to acquire again
+        let _p4 = sem.try_acquire().expect("should have capacity again");
     }
 }

@@ -27,6 +27,10 @@ pub struct Args {
     /// TLS private key (PEM). Requires building with --features tls and --tls-cert.
     #[arg(long)]
     pub tls_key: Option<PathBuf>,
+
+    /// Maximum concurrent transcodes (overrides config file). Default: 2
+    #[arg(long = "max-transcodes")]
+    pub max_transcodes: Option<usize>,
 }
 
 /// On-disk config schema. Every field is optional via `#[serde(default)]`.
@@ -134,7 +138,7 @@ impl Config {
             cache_max_bytes: (file.cache_max_gb * 1024.0 * 1024.0 * 1024.0) as u64,
             encoder: file.encoder,
             extensions: file.extensions.iter().map(|e| e.to_lowercase()).collect(),
-            max_concurrent_transcodes: file.max_concurrent_transcodes,
+            max_concurrent_transcodes: args.max_transcodes.unwrap_or(file.max_concurrent_transcodes),
             tls_cert: args.tls_cert,
             tls_key: args.tls_key,
         }
