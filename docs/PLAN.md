@@ -97,7 +97,7 @@ and several robustness/UX gaps. Work is tracked in the following GitHub issues:
 
 - **#3 (P0 — Critical)**: Stale HLS transcode cache on source file replacement / mtime change.
   The cache must be invalidated when the source changes (add `manifest.json` with mtime/size + probe data).
-- **#8 (P0 — High Impact)**: Major Apple Silicon (M4+) transcoding improvements — hardware decode (`-hwaccel videotoolbox`), zero-copy paths, rate control, and switch to modern fMP4 (`.m4s`) segments. Expected to give large gains in speed + dramatically lower CPU on M-series Macs.
+- **#8 (P0 — High Impact)**: Major Apple Silicon (M4+) transcoding improvements — hardware decode via `-hwaccel videotoolbox`, improved rate control with headroom (dynamic `-maxrate` + `-bufsize`, `-qmin`/`-qmax`), `-realtime` mode, and optional modern fMP4 (`.m4s`) output. Delivers significantly lower CPU usage and better consistency on M-series Macs.
 - **#4 (P1)**: No limit on concurrent transcodes → resource exhaustion risk on NAS / multi-user.
 - **#5 (P1)**: Transcode errors are opaque (no way to surface `ffmpeg.log` or actionable messages).
 - **#6 (P2 / Architecture)**: Segment-on-demand transcoding for instant arbitrary seeking on long files
@@ -110,7 +110,7 @@ See the session evaluation plan for the full analysis, repro steps, and recommen
 ## Next Possible Features (Living Roadmap)
 
 ### High-Priority Transcoding Evolution
-1. **Apple Silicon (M4+) ffmpeg improvements** (#8): Add hardware decode (`-hwaccel videotoolbox`), zero-copy paths, rate control, and switch to fMP4 segments. This is expected to be one of the highest-impact performance wins for the project on modern Macs.
+1. **Apple Silicon (M4+) ffmpeg improvements** (#8): Hardware decode (`-hwaccel videotoolbox`), dynamic rate control with headroom, `-realtime` mode, and optional fMP4 output. One of the highest-impact performance wins on M-series Macs (dramatically lower CPU usage).
 2. **Segment-on-demand transcoding** (see #6): Compute a VOD playlist from probed duration up front and
    transcode each requested segment (or small window) with `-ss` / `-to` for instant arbitrary seeking
    on huge files.

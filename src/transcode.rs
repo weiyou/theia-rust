@@ -1,11 +1,13 @@
 //! On-demand HLS transcoding: VP9/AV1/Opus (or anything) -> H.264/AAC.
 //!
 //! Supports two output formats (controlled by `hls_segment_format` in config):
-//! - "fmp4" (default): modern fragmented MP4 (.m4s) — strongly recommended on Apple Silicon
-//! - "ts": legacy MPEG-TS (.ts)
+//! - "fmp4": modern fragmented MP4 (.m4s)
+//! - "ts" (default): legacy MPEG-TS (.ts) — best compatibility with older devices
 //!
-//! On Apple Silicon (M1+), when using a `*_videotoolbox` encoder we now enable
-//! hardware decode + zero-copy paths (see #8 for the full set of improvements).
+//! On Apple Silicon (M1+), when using a `*_videotoolbox` encoder we enable
+//! hardware decoding (`-hwaccel videotoolbox`) plus improved rate control
+//! with headroom (`-maxrate`, dynamic `-bufsize`, `-qmin`/`-qmax`, `-realtime`).
+//! See GitHub issue #8 for the full set of Apple Silicon improvements.
 use crate::config::Config;
 use crate::probe::{self, ProbeCache};
 use crate::scan::{decode_path, resolve_within};
@@ -98,6 +100,26 @@ fn bitrate_for(height: u32) -> &'static str {
         h if h >= 720 => "3M",
         h if h >= 480 => "1500k",
         _ => "900k",
+    }
+}
+
+/// Scale a bitrate string (e.g. "6M", "3000k") by a factor.
+/// Used for dynamic -maxrate and -bufsize calculation.
+fn scale_bitrate(rate: &str, factor: f32) -> String {
+    let rate = rate.trim();
+    let (num_str, unit) = if let Some(s) = rate.strip_suffix('M') {
+        (s, "M")
+    } else if let Some(s) = rate.strip_suffix('k') {
+        (s, "k")
+    } else {
+        (rate, "")
+    };
+
+    if let Ok(n) = num_str.parse::<f32>() {
+        let scaled = (n * factor).round() as u32;
+        format!("{}{}", scaled, unit)
+    } else {
+        rate.to_string()
     }
 }
 
@@ -339,10 +361,12 @@ async fn start_session(
 
     let segment_ext = if use_fmp4 { "m4s" } else { "ts" };
     let segment_pattern = format!("seg-%05d.{}", segment_ext);
-    let init_filename = if use_fmp4 {
-        dir.join("init.mp4")
+    // For -hls_fmp4_init_filename, ffmpeg expects a filename (relative to the playlist),
+    // not a full absolute path. Using a full path here can cause "Failed to open segment" errors.
+    let init_filename: String = if use_fmp4 {
+        "init.mp4".to_string()
     } else {
-        PathBuf::new() // not used for TS
+        String::new()
     };
 
     let mut cmd = Command::new(&config.ffmpeg);
@@ -350,12 +374,11 @@ async fn start_session(
         .arg("-loglevel")
         .arg("warning");
 
-    // === Hardware decode + zero-copy on Apple Silicon (M1/M2/M3/M4) ===
-    // This is the big win proposed in #8
+    // === Hardware decode on Apple Silicon (M1/M2/M3/M4) ===
+    // Use a simple `-hwaccel videotoolbox` for broad compatibility (including AV1).
+    // This still gives very large CPU savings on M-series Macs.
     if is_videotoolbox {
         cmd.arg("-hwaccel")
-            .arg("videotoolbox")
-            .arg("-hwaccel_output_format")
             .arg("videotoolbox");
     }
 
@@ -372,16 +395,23 @@ async fn start_session(
         .arg("-b:v")
         .arg(bitrate);
 
-    // Additional Apple Silicon / quality tweaks from #8
+    // Apple Silicon rate control — balanced for consistent bitrate with some headroom
     if is_videotoolbox {
-        cmd.arg("-pix_fmt")
+        let maxrate = scale_bitrate(bitrate, 1.2);   // 20% headroom for quality on hard scenes
+        let bufsize = scale_bitrate(bitrate, 2.4);   // ~2x the maxrate for good buffer behavior
+
+        cmd.arg("-maxrate")
+            .arg(&maxrate)
+            .arg("-bufsize")
+            .arg(&bufsize)
+            .arg("-qmin")
+            .arg("15")
+            .arg("-qmax")
+            .arg("32")
+            .arg("-pix_fmt")
             .arg("yuv420p")
             .arg("-realtime")
-            .arg("1")
-            .arg("-maxrate")
-            .arg(bitrate)
-            .arg("-bufsize")
-            .arg("2M"); // reasonable default; can be made dynamic later
+            .arg("1");
     }
 
     cmd.arg("-tag:v")

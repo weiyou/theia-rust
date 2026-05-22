@@ -82,11 +82,18 @@ ffprobe = "ffprobe"
 cache_max_gb = 20.0                 # LRU cap for transcoded HLS segments
 encoder = "h264_videotoolbox"       # or "libx264" for better compression
 max_concurrent_transcodes = 2       # limit parallel ffmpeg jobs (P1 safeguard)
-hls_segment_format = "fmp4"         # "fmp4" (modern, recommended on M4/M3/M2) or "ts" (legacy MPEG-TS)
+hls_segment_format = "ts"           # "ts" (legacy MPEG-TS, best compatibility with older devices like old iPads)
+                                   # "fmp4" (modern fragmented MP4, better on recent clients & Apple Silicon)
 extensions = ["mp4", "m4v", "mov", "webm", "mkv", "avi", "ts", "flv"]
 ```
 
 CLI flags (`--root`, `--port`, `--tls-cert`, `--tls-key`) override the config file.
+
+**Note on `hls_segment_format`**:
+- `"ts"` (default): Uses classic MPEG-TS segments (`.ts`). Offers the widest compatibility, especially with older devices such as 2nd-generation iPads.
+- `"fmp4"`: Uses modern fragmented MP4 segments (`.m4s`). Can provide slightly better performance and seeking on newer clients and Apple Silicon Macs, but may not play on some older hardware.
+
+When using `h264_videotoolbox` (or other `*_videotoolbox` encoders) on Apple Silicon, Theia now enables hardware decoding and improved rate control (with headroom) for significantly lower CPU usage. See GitHub issue #8 for details.
 
 ## 🏗️ Development
 

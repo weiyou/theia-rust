@@ -68,7 +68,7 @@ impl Default for FileConfig {
                 .map(|s| s.to_string())
                 .collect(),
             max_concurrent_transcodes: 2,
-            hls_segment_format: "fmp4".to_string(), // modern default: fragmented MP4
+            hls_segment_format: "ts".to_string(), // "ts" = legacy MPEG-TS (best compatibility), "fmp4" = modern fragmented MP4
         }
     }
 }
@@ -89,7 +89,8 @@ pub struct Config {
     /// Maximum number of concurrent ffmpeg transcodes allowed.
     /// Additional requests queue (fairly) until a slot is free. Default: 2.
     pub max_concurrent_transcodes: usize,
-    /// "ts" (legacy MPEG-TS) or "fmp4" (modern fragmented MP4, recommended)
+    /// "ts" (legacy MPEG-TS, best compatibility with older devices)
+    /// or "fmp4" (modern fragmented MP4, better on recent clients & Apple Silicon)
     pub hls_segment_format: String,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
@@ -161,7 +162,8 @@ impl Config {
     }
 
     /// Returns true if we should output modern fragmented MP4 segments (.m4s)
-    /// instead of legacy MPEG-TS (.ts).
+    /// instead of legacy MPEG-TS (.ts). "fmp4" generally offers slightly better
+    /// compatibility on modern devices and better performance on Apple Silicon.
     pub fn uses_fmp4_segments(&self) -> bool {
         self.hls_segment_format == "fmp4"
     }
