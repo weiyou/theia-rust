@@ -82,6 +82,7 @@ ffprobe = "ffprobe"
 cache_max_gb = 20.0                 # LRU cap for transcoded HLS segments
 encoder = "h264_videotoolbox"       # or "libx264" for better compression
 max_concurrent_transcodes = 2       # limit parallel ffmpeg jobs (P1 safeguard)
+hls_segment_format = "fmp4"         # "fmp4" (modern, recommended on M4/M3/M2) or "ts" (legacy MPEG-TS)
 extensions = ["mp4", "m4v", "mov", "webm", "mkv", "avi", "ts", "flv"]
 ```
 

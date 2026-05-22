@@ -1,10 +1,11 @@
 //! On-demand HLS transcoding: VP9/AV1/Opus (or anything) -> H.264/AAC.
 //!
-//! When a client requests `/hls/{enc}/index.m3u8` we spawn one ffmpeg process that
-//! decodes the source and writes HLS TS segments + a growing (event) playlist into a
-//! per-file cache directory. Safari plays the playlist natively. On the M4 the
-//! hardware `h264_videotoolbox` encoder runs faster than realtime, so segments are
-//! produced ahead of playback and seeking works across the whole timeline.
+//! Supports two output formats (controlled by `hls_segment_format` in config):
+//! - "fmp4" (default): modern fragmented MP4 (.m4s) — strongly recommended on Apple Silicon
+//! - "ts": legacy MPEG-TS (.ts)
+//!
+//! On Apple Silicon (M1+), when using a `*_videotoolbox` encoder we now enable
+//! hardware decode + zero-copy paths (see #8 for the full set of improvements).
 use crate::config::Config;
 use crate::probe::{self, ProbeCache};
 use crate::scan::{decode_path, resolve_within};
@@ -123,11 +124,19 @@ pub async fn hls_handler(
     }
 }
 
-/// Only allow `seg-NNNNN.ts` so the segment name can't escape the cache dir.
+/// Only allow valid segment names (`seg-NNNNN.ts` or `seg-NNNNN.m4s`)
+/// so the segment name can't escape the cache dir.
 fn is_segment_name(seg: &str) -> bool {
-    seg.strip_prefix("seg-")
-        .and_then(|s| s.strip_suffix(".ts"))
-        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    let allowed = [".ts", ".m4s"];
+    for ext in allowed {
+        if let Some(digits) = seg
+            .strip_prefix("seg-")
+            .and_then(|s| s.strip_suffix(ext))
+        {
+            return !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+        }
+    }
+    false
 }
 
 /// Load a cache manifest if present (returns None for old caches without one).
@@ -325,11 +334,32 @@ async fn start_session(
 
     let log = std::fs::File::create(dir.join("ffmpeg.log"))?;
 
+    let is_videotoolbox = config.encoder.contains("videotoolbox");
+    let use_fmp4 = config.uses_fmp4_segments();
+
+    let segment_ext = if use_fmp4 { "m4s" } else { "ts" };
+    let segment_pattern = format!("seg-%05d.{}", segment_ext);
+    let init_filename = if use_fmp4 {
+        dir.join("init.mp4")
+    } else {
+        PathBuf::new() // not used for TS
+    };
+
     let mut cmd = Command::new(&config.ffmpeg);
     cmd.arg("-hide_banner")
         .arg("-loglevel")
-        .arg("warning")
-        .arg("-i")
+        .arg("warning");
+
+    // === Hardware decode + zero-copy on Apple Silicon (M1/M2/M3/M4) ===
+    // This is the big win proposed in #8
+    if is_videotoolbox {
+        cmd.arg("-hwaccel")
+            .arg("videotoolbox")
+            .arg("-hwaccel_output_format")
+            .arg("videotoolbox");
+    }
+
+    cmd.arg("-i")
         .arg(file)
         .arg("-map")
         .arg("0:v:0")
@@ -340,8 +370,21 @@ async fn start_session(
         .arg("-profile:v")
         .arg("high")
         .arg("-b:v")
-        .arg(bitrate)
-        .arg("-tag:v")
+        .arg(bitrate);
+
+    // Additional Apple Silicon / quality tweaks from #8
+    if is_videotoolbox {
+        cmd.arg("-pix_fmt")
+            .arg("yuv420p")
+            .arg("-realtime")
+            .arg("1")
+            .arg("-maxrate")
+            .arg(bitrate)
+            .arg("-bufsize")
+            .arg("2M"); // reasonable default; can be made dynamic later
+    }
+
+    cmd.arg("-tag:v")
         .arg("avc1")
         .arg("-c:a")
         .arg("aac")
@@ -352,13 +395,30 @@ async fn start_session(
         .arg("-f")
         .arg("hls")
         .arg("-hls_time")
-        .arg(SEGMENT_SECONDS.to_string())
-        .arg("-hls_flags")
-        .arg("independent_segments")
-        .arg("-hls_playlist_type")
-        .arg("event")
+        .arg(SEGMENT_SECONDS.to_string());
+
+    // === HLS output format (legacy TS vs modern fMP4) ===
+    if use_fmp4 {
+        cmd.arg("-hls_segment_type")
+            .arg("fmp4")
+            .arg("-hls_fmp4_init_filename")
+            .arg(&init_filename)
+            .arg("-hls_list_size")
+            .arg("0");
+    } else {
+        cmd.arg("-hls_playlist_type")
+            .arg("event");
+    }
+
+    // Common flags + delete_segments (prevents long-running sessions from filling disk)
+    let mut hls_flags = String::from("independent_segments");
+    if use_fmp4 {
+        hls_flags.push_str("+delete_segments");
+    }
+    cmd.arg("-hls_flags")
+        .arg(hls_flags)
         .arg("-hls_segment_filename")
-        .arg(dir.join("seg-%05d.ts"))
+        .arg(dir.join(&segment_pattern))
         .arg(dir.join("index.m3u8"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -512,6 +572,7 @@ mod tests {
     fn segment_names_are_strictly_validated() {
         assert!(is_segment_name("seg-00000.ts"));
         assert!(is_segment_name("seg-12.ts"));
+        assert!(is_segment_name("seg-00001.m4s")); // fMP4 support (#8)
         // Anything that could escape the cache dir is rejected.
         assert!(!is_segment_name("seg-.ts"));
         assert!(!is_segment_name("seg-1a.ts"));

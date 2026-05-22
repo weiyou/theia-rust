@@ -48,6 +48,7 @@ struct FileConfig {
     encoder: String,
     extensions: Vec<String>,
     max_concurrent_transcodes: usize,
+    hls_segment_format: String,
 }
 
 impl Default for FileConfig {
@@ -67,6 +68,7 @@ impl Default for FileConfig {
                 .map(|s| s.to_string())
                 .collect(),
             max_concurrent_transcodes: 2,
+            hls_segment_format: "fmp4".to_string(), // modern default: fragmented MP4
         }
     }
 }
@@ -87,6 +89,8 @@ pub struct Config {
     /// Maximum number of concurrent ffmpeg transcodes allowed.
     /// Additional requests queue (fairly) until a slot is free. Default: 2.
     pub max_concurrent_transcodes: usize,
+    /// "ts" (legacy MPEG-TS) or "fmp4" (modern fragmented MP4, recommended)
+    pub hls_segment_format: String,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
 }
@@ -139,6 +143,7 @@ impl Config {
             encoder: file.encoder,
             extensions: file.extensions.iter().map(|e| e.to_lowercase()).collect(),
             max_concurrent_transcodes: args.max_transcodes.unwrap_or(file.max_concurrent_transcodes),
+            hls_segment_format: file.hls_segment_format.to_lowercase(),
             tls_cert: args.tls_cert,
             tls_key: args.tls_key,
         }
@@ -153,6 +158,12 @@ impl Config {
             }
             None => false,
         }
+    }
+
+    /// Returns true if we should output modern fragmented MP4 segments (.m4s)
+    /// instead of legacy MPEG-TS (.ts).
+    pub fn uses_fmp4_segments(&self) -> bool {
+        self.hls_segment_format == "fmp4"
     }
 }
 
