@@ -61,6 +61,7 @@ async fn main() {
         .route("/playall/:enc", get(listing::playall_handler))
         .route("/stream/:enc", get(stream::stream_handler))
         .route("/hls/:enc/:seg", get(transcode::hls_handler))
+        .route("/hls/:enc/ffmpeg.log", get(transcode::ffmpeg_log_handler))
         .route("/status", get(transcode::status_handler))
         .layer(middleware::from_fn_with_state(
             state.clone(),

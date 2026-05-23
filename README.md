@@ -79,7 +79,7 @@ port = 32450
 ffmpeg = "ffmpeg"                   # or an absolute path
 ffprobe = "ffprobe"
 # cache_dir = "/path/to/cache"      # default: OS cache dir /theia/hls
-cache_max_gb = 20.0                 # LRU cap for transcoded HLS segments
+cache_max_gb = 10.0                 # LRU + age cap for transcoded HLS caches (default 10 GB)
 encoder = "h264_videotoolbox"       # or "libx264" for better compression
 max_concurrent_transcodes = 2       # limit parallel ffmpeg jobs (P1 safeguard)
 hls_segment_format = "ts"           # "ts" (legacy MPEG-TS, best compatibility with older devices like old iPads)
@@ -94,6 +94,13 @@ CLI flags (`--root`, `--port`, `--tls-cert`, `--tls-key`) override the config fi
 - `"fmp4"`: Uses modern fragmented MP4 segments (`.m4s`). Can provide slightly better performance and seeking on newer clients and Apple Silicon Macs, but may not play on some older hardware.
 
 When using `h264_videotoolbox` (or other `*_videotoolbox` encoders) on Apple Silicon, Theia now enables hardware decoding and improved rate control (with headroom) for significantly lower CPU usage. See GitHub issue #8 for details.
+
+### Debugging Transcode Failures
+If a video fails to play via the H264/AAC button, you can inspect the raw `ffmpeg` output:
+- Call `GET /hls/{enc}/ffmpeg.log` (authenticated) — this returns the log file written during the transcode attempt.
+- The server also logs the tail of the ffmpeg log at ERROR level on failure (visible if `RUST_LOG=theia=error` or similar).
+
+This greatly improves observability for issues like unsupported codecs, missing streams, or encoder problems (GitHub issue #5).
 
 ## 🏗️ Development
 
@@ -148,7 +155,8 @@ theia-rust/
 - `GET /meta/{enc}` - JSON codec/resolution/size metadata (ffprobe, cached)
 - `GET /play/{enc}` - Player page that plays the file as transcoded H.264/AAC HLS
 - `GET /hls/{enc}/index.m3u8` - On-demand HLS playlist (starts/attaches a transcode)
-- `GET /hls/{enc}/seg-NNNNN.ts` - Transcoded HLS segment
+- `GET /hls/{enc}/seg-NNNNN.ts` (or .m4s) - Transcoded HLS segment
+- `GET /hls/{enc}/ffmpeg.log` - Raw ffmpeg log for debugging transcode failures (auth required)
 - `GET /status` - JSON status of active transcodes and concurrency limit (auth required)
 - `GET /playall/{enc}` - Auto-play (direct-stream) playlist for a folder
 

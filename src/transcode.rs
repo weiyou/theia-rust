@@ -35,6 +35,10 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long to wait for ffmpeg to produce the first playlist entry.
 const PLAYLIST_WAIT: Duration = Duration::from_secs(20);
 
+/// Maximum age for a completed HLS cache directory before it is eligible for
+/// time-based cleanup (even if we are under the size limit).
+const MAX_CACHE_AGE: Duration = Duration::from_secs(3 * 3600); // 3 hours
+
 struct Session {
     dir: PathBuf,
     /// Human-friendly name for status/debug pages (e.g. "movie.mkv").
@@ -138,7 +142,7 @@ pub async fn hls_handler(
     };
 
     if seg == "index.m3u8" {
-        serve_playlist(&state, &file).await
+        serve_playlist(&state, &file, &encoded_path).await
     } else if is_segment_name(&seg) {
         serve_segment(&state, &file, &seg).await
     } else {
@@ -204,17 +208,35 @@ async fn validate_cached_transcode(
     if !playlist.exists() {
         return false;
     }
-    match load_manifest(dir).await {
+
+    // Check manifest + source mtime/size
+    let manifest_ok = match load_manifest(dir).await {
         Some(m) if source_matches_manifest(file, &m).await => true,
-        _ => {
-            // Stale, missing manifest (old cache), or source changed → blow it away.
-            let _ = tokio::fs::remove_dir_all(dir).await;
-            false
-        }
+        _ => false,
+    };
+
+    if !manifest_ok {
+        let _ = tokio::fs::remove_dir_all(dir).await;
+        return false;
     }
+
+    // Additional check: if the previous transcode never finished (no ENDLIST),
+    // treat the cache as incomplete and restart.
+    if let Ok(contents) = tokio::fs::read_to_string(playlist).await {
+        if !contents.contains("EXT-X-ENDLIST") {
+            let _ = tokio::fs::remove_dir_all(dir).await;
+            return false;
+        }
+    } else {
+        // Can't read playlist → treat as bad
+        let _ = tokio::fs::remove_dir_all(dir).await;
+        return false;
+    }
+
+    true
 }
 
-async fn serve_playlist(state: &AppState, file: &StdPath) -> Response {
+async fn serve_playlist(state: &AppState, file: &StdPath, encoded_path: &str) -> Response {
     let mgr = &state.transcoder;
     let key = key_for(file);
     let dir = mgr.config.cache_dir.join(&key);
@@ -236,9 +258,22 @@ async fn serve_playlist(state: &AppState, file: &StdPath) -> Response {
                     sessions.insert(key.clone(), session);
                 }
                 Err(e) => {
+                    // Try to surface the last part of the ffmpeg log for debugging
+                    if let Ok(log_bytes) = tokio::fs::read(dir.join("ffmpeg.log")).await {
+                        let tail = String::from_utf8_lossy(&log_bytes[log_bytes.len().saturating_sub(4096)..]);
+                        tracing::error!(
+                            file = %file.display(),
+                            error = %e,
+                            "Transcoder failed to start. Recent ffmpeg log tail:\n{}",
+                            tail
+                        );
+                    }
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to start transcoder: {e}"),
+                        format!(
+                            "Failed to start transcoder: {e}. Check GET /hls/{}/ffmpeg.log for the full log.",
+                            encoded_path
+                        ),
                     )
                         .into_response();
                 }
@@ -255,9 +290,21 @@ async fn serve_playlist(state: &AppState, file: &StdPath) -> Response {
             return playlist_response(contents);
         }
         if Instant::now() >= deadline {
+            // Log the tail of the ffmpeg log for debugging on timeout
+            if let Ok(log_bytes) = tokio::fs::read(dir.join("ffmpeg.log")).await {
+                let tail = String::from_utf8_lossy(&log_bytes[log_bytes.len().saturating_sub(4096)..]);
+                tracing::error!(
+                    file = %file.display(),
+                    "Transcoder timed out waiting for first segment. Recent ffmpeg log tail:\n{}",
+                    tail
+                );
+            }
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Transcoder did not produce output in time (check the source codecs / ffmpeg log)",
+                format!(
+                    "Transcoder did not produce output in time. Check GET /hls/{}/ffmpeg.log for details.",
+                    encoded_path
+                ),
             )
                 .into_response();
         }
@@ -504,6 +551,8 @@ async fn evict_cache(mgr: &TranscodeManager) {
 
     let mut dirs: Vec<(PathBuf, u64, std::time::SystemTime)> = vec![];
     let mut total: u64 = 0;
+    let now = std::time::SystemTime::now();
+
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
         if !path.is_dir() {
@@ -516,6 +565,18 @@ async fn evict_cache(mgr: &TranscodeManager) {
             .ok()
             .and_then(|m| m.accessed().or_else(|_| m.modified()).ok())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+        // Time-based cleanup: delete anything older than MAX_CACHE_AGE (3 hours)
+        // even if we are still under the size limit.
+        if let Ok(age) = now.duration_since(accessed) {
+            if age > MAX_CACHE_AGE && !active.contains(&path) {
+                if tokio::fs::remove_dir_all(&path).await.is_ok() {
+                    // do not add to total / dirs
+                    continue;
+                }
+            }
+        }
+
         total += size;
         dirs.push((path, size, accessed));
     }
@@ -593,6 +654,45 @@ pub async fn status_handler(State(state): State<AppState>) -> impl IntoResponse 
         .into_response()
 }
 
+/// `GET /hls/{enc}/ffmpeg.log` — serves the ffmpeg log for a given media file (if it exists).
+/// Useful for debugging transcode failures (see issue #5).
+pub async fn ffmpeg_log_handler(
+    Path(encoded_path): Path<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let decoded = match decode_path(&encoded_path) {
+        Some(d) => d,
+        None => return (StatusCode::BAD_REQUEST, "Invalid path encoding").into_response(),
+    };
+
+    let file = match resolve_within(&state.config.root, &decoded) {
+        Some(p) if state.config.is_media(&p) && p.is_file() => p,
+        _ => return (StatusCode::NOT_FOUND, "File not found").into_response(),
+    };
+
+    let key = key_for(&file);
+    let log_path = state.config.cache_dir.join(&key).join("ffmpeg.log");
+
+    match tokio::fs::read(&log_path).await {
+        Ok(bytes) => {
+            // Cap very large logs (serve last 256KB)
+            let max_size: usize = 256 * 1024;
+            let content = if bytes.len() > max_size {
+                bytes[bytes.len() - max_size..].to_vec()
+            } else {
+                bytes
+            };
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                content,
+            )
+                .into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "No log available for this file").into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{bitrate_for, is_segment_name, load_manifest, write_manifest, CacheManifest, validate_cached_transcode};
@@ -654,9 +754,9 @@ mod tests {
         assert_eq!(loaded.source_size, 15);
         assert_eq!(loaded.vcodec, "vp9");
 
-        // validate should succeed while source is unchanged
+        // validate should succeed while source is unchanged and playlist is complete
         let playlist = tmp.join("index.m3u8");
-        tokio::fs::write(&playlist, "#EXTM3U\nseg-00000.ts\n").await.unwrap();
+        tokio::fs::write(&playlist, "#EXTM3U\nseg-00000.ts\n#EXT-X-ENDLIST\n").await.unwrap();
         assert!(validate_cached_transcode(&src_file, &tmp, &playlist).await);
 
         // Now mutate the source (size changes → must be treated as stale).
