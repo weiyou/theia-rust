@@ -49,6 +49,8 @@ struct FileConfig {
     extensions: Vec<String>,
     max_concurrent_transcodes: usize,
     hls_segment_format: String,
+    /// Future: "linear" (current event playlist from t=0) or "segment" (on-demand per-segment)
+    transcode_mode: String,
 }
 
 impl Default for FileConfig {
@@ -69,6 +71,7 @@ impl Default for FileConfig {
                 .collect(),
             max_concurrent_transcodes: 2,
             hls_segment_format: "ts".to_string(), // "ts" = legacy MPEG-TS (best compatibility), "fmp4" = modern fragmented MP4
+            transcode_mode: "linear".to_string(), // "linear" (current) or "segment" (future on-demand)
         }
     }
 }
@@ -92,6 +95,8 @@ pub struct Config {
     /// "ts" (legacy MPEG-TS, best compatibility with older devices)
     /// or "fmp4" (modern fragmented MP4, better on recent clients & Apple Silicon)
     pub hls_segment_format: String,
+    /// "linear" (current event playlist model) or "segment" (future per-segment on-demand)
+    pub transcode_mode: String,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
 }
@@ -145,6 +150,7 @@ impl Config {
             extensions: file.extensions.iter().map(|e| e.to_lowercase()).collect(),
             max_concurrent_transcodes: args.max_transcodes.unwrap_or(file.max_concurrent_transcodes),
             hls_segment_format: file.hls_segment_format.to_lowercase(),
+            transcode_mode: file.transcode_mode.to_lowercase(),
             tls_cert: args.tls_cert,
             tls_key: args.tls_key,
         }
@@ -166,6 +172,11 @@ impl Config {
     /// compatibility on modern devices and better performance on Apple Silicon.
     pub fn uses_fmp4_segments(&self) -> bool {
         self.hls_segment_format == "fmp4"
+    }
+
+    /// Whether we are in the future per-segment on-demand mode (vs current linear event mode).
+    pub fn is_segment_on_demand(&self) -> bool {
+        self.transcode_mode == "segment"
     }
 }
 
