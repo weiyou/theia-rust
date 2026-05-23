@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, "feat/*" ]
+  pull_request:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test + Lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Run tests
+        run: cargo test --verbose
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  # Optional: future job for ffmpeg smoke tests when we have integration tests
+  # ffmpeg-smoke:
+  #   ...

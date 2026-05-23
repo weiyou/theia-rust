@@ -117,15 +117,17 @@ cd theia-rust
 cargo build --release
 ```
 
-### Run Tests
+### Run Tests + Lint
 
 ```bash
 cargo test
+cargo clippy --all-targets
 ```
 
-For the full manual verification matrix (including the new P0 stale-cache behavior and HLS end-to-end),
-see the **✅ Verification** section above. `cargo test` now also covers the manifest round-trip and
-invalidation logic added after the v0.3 evaluation.
+These checks also run automatically on PRs via GitHub Actions (see `.github/workflows/ci.yml`).
+
+For the full manual verification matrix (including cache behavior and HLS end-to-end),
+see the **✅ Verification** section above.
 ### Project Structure
 
 ```
@@ -165,9 +167,11 @@ theia-rust/
 ### Automated Tests
 ```bash
 cargo test
+cargo clippy --all-targets
 ```
-This covers path safety, segment name validation, bitrate ladder, and (since the v0.3 evaluation)
-the new P0 cache manifest + stale source invalidation logic in `transcode.rs`.
+These are also run automatically on every PR and push via the CI workflow (`.github/workflows/ci.yml`).
+
+Current coverage includes path safety, segment validation, bitrate logic, concurrency limiting, manifest validation, and stale cache detection. Full end-to-end tests that spin up the server and exercise real `ffmpeg` transcodes are tracked in GitHub issue #7.
 
 ### Manual End-to-End Matrix (recommended before releases)
 

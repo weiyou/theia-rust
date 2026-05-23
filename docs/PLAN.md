@@ -82,12 +82,10 @@ Optional `tls` feature: axum-server (tls-rustls). Runtime: ffmpeg + ffprobe on P
 Unit tests: path encode/decode + traversal containment (`scan.rs`), segment-name validation
 and bitrate selection (`transcode.rs`).
 
-The HLS transcoding paths currently have only manual verification (generated VP9/AV1/H264
-samples exercising listing, /meta, /hls playlist+segments, seeking within produced prefix,
-traversal safety, and HTTPS). See the new "Verification" section being added to README.md
-and the related GitHub issue for adding automated smoke/integration coverage that exercises
-ffmpeg. A full evaluation of the v0.3 transcoding implementation (including gaps) lives in
-the session plan for the feature branch.
+The HLS transcoding paths currently have solid unit test coverage + manual verification.
+A basic CI workflow now runs `cargo test + clippy` on PRs and pushes (see `.github/workflows/ci.yml`).
+Full automated integration tests that exercise real `ffmpeg` transcoding are tracked in issue #7.
+See the expanded "✅ Verification" section in README.md for the current recommended manual test matrix.
 
 ## Current Status & Known Gaps (Post-v0.3 Evaluation)
 
