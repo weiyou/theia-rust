@@ -61,7 +61,7 @@ impl Default for FileConfig {
             ffmpeg: PathBuf::from("ffmpeg"),
             ffprobe: PathBuf::from("ffprobe"),
             cache_dir: None,
-            cache_max_gb: 20.0,
+            cache_max_gb: 10.0,
             encoder: "h264_videotoolbox".to_string(),
             extensions: ["mp4", "m4v", "mov", "webm", "mkv", "avi", "ts", "flv"]
                 .iter()
