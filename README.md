@@ -81,9 +81,14 @@ ffprobe = "ffprobe"
 # cache_dir = "/path/to/cache"      # default: OS cache dir /theia/hls
 cache_max_gb = 10.0                 # LRU + age cap for transcoded HLS caches (default 10 GB)
 encoder = "h264_videotoolbox"       # or "libx264" for better compression
-max_concurrent_transcodes = 2       # limit parallel ffmpeg jobs (P1 safeguard)
+max_concurrent_transcodes = 4       # limit parallel ffmpeg jobs (raised default thanks to HW decode on Apple Silicon)
 hls_segment_format = "ts"           # "ts" (legacy MPEG-TS, best compatibility with older devices like old iPads)
                                    # "fmp4" (modern fragmented MP4, better on recent clients & Apple Silicon)
+max_concurrent_transcodes = 4       # How many videos can be actively transcoded at once.
+                                   # 4 is a good default on M-series with hardware decode.
+                                   # You can go higher (6–8) on M3/M4 Pro/Max machines.
+transcode_mode = "linear"           # "linear" (current event playlist from t=0) or "segment" (experimental
+                                   # per-segment on-demand generation for much faster seeking on long files).
 extensions = ["mp4", "m4v", "mov", "webm", "mkv", "avi", "ts", "flv"]
 ```
 
@@ -92,6 +97,10 @@ CLI flags (`--root`, `--port`, `--tls-cert`, `--tls-key`) override the config fi
 **Note on `hls_segment_format`**:
 - `"ts"` (default): Uses classic MPEG-TS segments (`.ts`). Offers the widest compatibility, especially with older devices such as 2nd-generation iPads.
 - `"fmp4"`: Uses modern fragmented MP4 segments (`.m4s`). Can provide slightly better performance and seeking on newer clients and Apple Silicon Macs, but may not play on some older hardware.
+
+**Note on `transcode_mode`** (experimental):
+- `"linear"` (default): The traditional behavior — one long ffmpeg process produces a growing event playlist. Seeking works within already-generated segments.
+- `"segment"`: Enables true segment-on-demand mode. Theia serves a complete VOD playlist upfront and generates individual segments on demand using `-ss`. This enables much faster arbitrary seeking on long files (see GitHub issue #6). Pre-warming of early segments in a directory is also supported after sustained watching.
 
 When using `h264_videotoolbox` (or other `*_videotoolbox` encoders) on Apple Silicon, Theia now enables hardware decoding and improved rate control (with headroom) for significantly lower CPU usage. See GitHub issue #8 for details.
 
@@ -192,8 +201,12 @@ Use a clean `~/Theia_Home` (or `--root /tmp/theia-test`) and `ffmpeg` on PATH.
 
 3. **Seeking & Long-Form Behavior**
    - Use a longer source (> 10 min).
-   - Play, then seek far forward (e.g. 80%).
-   - Note the buffering time — this demonstrates the current linear "event" playlist limitation (ffmpeg must reach that point). See issue #6 for the planned segment-on-demand improvement.
+   - With the default `transcode_mode = "linear"`, play then seek far forward (e.g. 80%).
+   - Note the buffering time — this demonstrates the linear event playlist limitation.
+   - You can experiment with the new experimental segment-on-demand mode by setting
+     `transcode_mode = "segment"` in the config (see issue #6). In this mode Theia serves
+     a full VOD playlist upfront and generates individual segments on demand with `-ss`,
+     enabling much faster arbitrary seeking.
 
 4. **Lifecycle & Resources**
    - Start several H264/AAC transcodes.
@@ -248,10 +261,10 @@ See [PLAN.md](docs/PLAN.md) for the living architecture document (updated after 
 v0.3 HLS transcoding evaluation) and the full roadmap. Key follow-up work is tracked
 in GitHub issues:
 - [#3](https://github.com/weiyou/theia-rust/issues/3) — P0 stale cache invalidation + source manifest (completed in this prototype)
-- [#6](https://github.com/weiyou/theia-rust/issues/6) — Segment-on-demand for instant arbitrary seeking
-- [#4](https://github.com/weiyou/theia-rust/issues/4), [#5](https://github.com/weiyou/theia-rust/issues/5), [#7](https://github.com/weiyou/theia-rust/issues/7) — concurrency limits, error visibility, and testing/CI improvements
+- [#6](https://github.com/weiyou/theia-rust/issues/6) — Segment-on-demand for instant arbitrary seeking (prototype implemented; enable with `transcode_mode = "segment"`)
+- [#4](https://github.com/weiyou/theia-rust/issues/4), [#5](https://github.com/weiyou/theia-rust/issues/5), [#7](https://github.com/weiyou/theia-rust/issues/7) — concurrency limits, error visibility, and testing/CI improvements (significant progress made)
 
-Planned enhancements also include:
+Other planned enhancements include:
 - Transcoded "Play All" for folders
 - Smarter per-file "Play" vs "H264/AAC" buttons using probe data
 - File upload / search / bulk operations

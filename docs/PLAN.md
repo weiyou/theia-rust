@@ -98,8 +98,11 @@ and several robustness/UX gaps. Work is tracked in the following GitHub issues:
 - **#8 (P0 — High Impact)**: Major Apple Silicon (M4+) transcoding improvements — hardware decode via `-hwaccel videotoolbox`, improved rate control with headroom (dynamic `-maxrate` + `-bufsize`, `-qmin`/`-qmax`), `-realtime` mode, and optional modern fMP4 (`.m4s`) output. Delivers significantly lower CPU usage and better consistency on M-series Macs.
 - **#4 (P1)**: No limit on concurrent transcodes → resource exhaustion risk on NAS / multi-user.
 - **#5 (P1)**: Transcode errors are opaque (no way to surface `ffmpeg.log` or actionable messages).
-- **#6 (P2 / Architecture)**: Segment-on-demand transcoding for instant arbitrary seeking on long files
-  (elevated from the pre-existing roadmap item below).
+- **#6 (P2 / Architecture)**: Segment-on-demand transcoding for instant arbitrary seeking on long files.
+  A working prototype exists: full VOD playlist generation from duration, per-segment on-demand
+  generation with `-ss`, watched-time tracking (15 min wall-clock trigger), and lazy directory
+  pre-warming of the first ~12s of other non-H.264/AAC videos. Controlled by `transcode_mode = "segment"`.
+  Still experimental — see the issue for remaining polish items.
 - **#7**: Testing, CI, and docs gaps for the transcoding feature (integration coverage, PR smoke jobs,
   reproducible verification steps in README).
 
@@ -109,9 +112,12 @@ See the session evaluation plan for the full analysis, repro steps, and recommen
 
 ### High-Priority Transcoding Evolution
 1. **Apple Silicon (M4+) ffmpeg improvements** (#8): Hardware decode (`-hwaccel videotoolbox`), dynamic rate control with headroom, `-realtime` mode, and optional fMP4 output. One of the highest-impact performance wins on M-series Macs (dramatically lower CPU usage).
-2. **Segment-on-demand transcoding** (see #6): Compute a VOD playlist from probed duration up front and
-   transcode each requested segment (or small window) with `-ss` / `-to` for instant arbitrary seeking
-   on huge files.
+2. **Segment-on-demand transcoding** (see #6): A working prototype is implemented.
+   - VOD playlist generation from duration.
+   - On-demand per-segment generation using short ffmpeg `-ss` invocations.
+   - Watched-time tracking + lazy directory pre-warming (first 10–15s of other non-H.264/AAC videos after 15 min of watching one title).
+   - Controlled via `transcode_mode = "segment"`.
+   Remaining work: full resume window protection, better integration with fMP4 output, polish on pre-warming, and production hardening.
 3. **Cache correctness + manifest** (#3): Lightweight `manifest.json` per cache dir.
 
 ### UX Polish
