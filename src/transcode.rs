@@ -35,6 +35,16 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long to wait for ffmpeg to produce the first playlist entry.
 const PLAYLIST_WAIT: Duration = Duration::from_secs(20);
 
+/// Segment-on-demand (#6): how many segments one on-demand ffmpeg invocation
+/// produces. Requests are snapped to a fixed grid of this size so concurrent
+/// requests for nearby segments share a single transcode (and so windows are
+/// non-overlapping and deduplicatable). 5 × 6s = 30s per window.
+const WINDOW_SEGMENTS: u32 = 5;
+/// How long a segment request waits for an in-flight window transcode to
+/// produce the requested segment before giving up. Generous to absorb the
+/// keyframe-decode cost of a deep seek into a large file.
+const WINDOW_WAIT: Duration = Duration::from_secs(25);
+
 /// Maximum age for a completed HLS cache directory before it is eligible for
 /// time-based cleanup (even if we are under the size limit).
 const MAX_CACHE_AGE: Duration = Duration::from_secs(3 * 3600); // 3 hours
@@ -72,8 +82,14 @@ pub struct TranscodeManager {
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     probe_cache: ProbeCache,
     /// Limits how many ffmpeg transcodes may run concurrently.
-    /// Uses OwnedSemaphorePermit stored in each active Session.
+    /// Linear mode holds a permit in each active Session; segment-on-demand
+    /// mode (#6) holds a permit only for the duration of each short window job.
     semaphore: Arc<Semaphore>,
+    /// In-flight segment-on-demand window transcodes, keyed by
+    /// `"{file_key}:{window_start_segment}"`. Used to deduplicate concurrent
+    /// requests for segments that fall in the same window so we never spawn a
+    /// duplicate ffmpeg for it. Entries are removed when the job exits.
+    windows: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl TranscodeManager {
@@ -84,6 +100,7 @@ impl TranscodeManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             probe_cache,
             semaphore: Arc::new(Semaphore::new(permits)),
+            windows: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 }
@@ -341,6 +358,10 @@ async fn serve_playlist(state: &AppState, file: &StdPath, encoded_path: &str) ->
     let mgr = &state.transcoder;
     let config = &mgr.config;
 
+    if config.is_segment_on_demand() {
+        return serve_playlist_segment(mgr, file).await;
+    }
+
     let key = key_for(file);
     let dir = config.cache_dir.join(&key);
     let playlist = dir.join("index.m3u8");
@@ -425,12 +446,9 @@ async fn read_playlist(playlist: &StdPath) -> Response {
 /// Generate a complete VOD-style HLS playlist (every segment listed up front,
 /// terminated by `#EXT-X-ENDLIST`) from a known duration.
 ///
-/// This is a building block for the planned segment-on-demand mode (#6) and is
-/// intentionally NOT yet wired into request serving: a correct implementation
-/// also needs per-segment transcoding with proper timestamp offsets, keyframe
-/// alignment, concurrency limiting, and fMP4 support. Kept (with a unit test) so
-/// that work can build on a verified playlist generator. See issue #6.
-#[allow(dead_code)]
+/// This is the playlist served in segment-on-demand mode (#6): the player sees
+/// the whole timeline immediately and can seek anywhere; each `.ts` segment is
+/// transcoded on first request (see [`serve_segment_segment`]).
 pub fn generate_vod_playlist(duration: f64, segment_seconds: u32) -> String {
     if duration <= 0.0 {
         return "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXT-X-ENDLIST\n".to_string();
@@ -472,6 +490,10 @@ async fn serve_segment(state: &AppState, file: &StdPath, seg: &str) -> Response 
     let mgr = &state.transcoder;
     let key = key_for(file);
 
+    if mgr.config.is_segment_on_demand() {
+        return serve_segment_segment(mgr, file, seg).await;
+    }
+
     // Keep the owning session alive while its segments are being fetched.
     if let Some(session) = mgr.sessions.lock().await.get_mut(&key) {
         session.last_access = Instant::now();
@@ -486,6 +508,352 @@ async fn serve_segment(state: &AppState, file: &StdPath, seg: &str) -> Response 
         )
             .into_response(),
         Err(_) => (StatusCode::NOT_FOUND, "Segment not ready").into_response(),
+    }
+}
+
+// ===========================================================================
+// Segment-on-demand mode (#6)
+//
+// Instead of one long ffmpeg producing a growing playlist from t=0, segment
+// mode serves a complete VOD playlist immediately (computed from the probed
+// duration) and transcodes segments on demand. Requests are snapped to a fixed
+// grid of WINDOW_SEGMENTS, so one short ffmpeg invocation — seeked to the
+// window start, with forced 6s keyframes and `-output_ts_offset` so segment N's
+// PTS is exactly 6*N — produces a run of segments that line up seamlessly with
+// the playlist and with adjacent windows. Each window job holds a concurrency
+// permit only while it runs (so #4's limit still applies), and concurrent
+// requests for the same window are deduplicated.
+//
+// fMP4 is not yet supported in this mode; segments are always MPEG-TS.
+// ===========================================================================
+
+/// First segment index of the window containing `seg`.
+fn window_start(seg: u32) -> u32 {
+    (seg / WINDOW_SEGMENTS) * WINDOW_SEGMENTS
+}
+
+/// Parse the segment index out of a validated `seg-NNNNN.ts` / `.m4s` name.
+fn parse_segment_number(seg: &str) -> Option<u32> {
+    seg.strip_prefix("seg-")
+        .and_then(|s| s.split('.').next())
+        .and_then(|n| n.parse().ok())
+}
+
+/// Build the source manifest for a file from its probe + filesystem metadata.
+async fn build_manifest(file: &StdPath, probe: &probe::Probe) -> CacheManifest {
+    let meta = tokio::fs::metadata(file).await.ok();
+    let source_mtime_unix = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    CacheManifest {
+        source_mtime_unix,
+        source_size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+        duration: probe.duration,
+        width: probe.width,
+        height: probe.height,
+        vcodec: probe.vcodec.clone(),
+        acodec: probe.acodec.clone(),
+    }
+}
+
+/// Ensure the cache dir for a segment-mode file is present and not stale.
+/// If the manifest is missing or the source changed, the directory is wiped
+/// (dropping segments that no longer match) and a fresh manifest written.
+async fn ensure_segment_cache_fresh(file: &StdPath, dir: &StdPath, probe: &probe::Probe) {
+    let fresh = match load_manifest(dir).await {
+        Some(m) => source_matches_manifest(file, &m).await,
+        None => false,
+    };
+    if !fresh {
+        let _ = tokio::fs::remove_dir_all(dir).await;
+        if tokio::fs::create_dir_all(dir).await.is_ok() {
+            let _ = write_manifest(dir, &build_manifest(file, probe).await).await;
+        }
+    }
+}
+
+/// `GET /hls/{enc}/index.m3u8` in segment-on-demand mode: serve the full VOD
+/// playlist computed from the probed duration. Segments are produced on demand.
+async fn serve_playlist_segment(mgr: &TranscodeManager, file: &StdPath) -> Response {
+    let config = &mgr.config;
+    let probe = match probe::probe(&config.ffprobe, file, &mgr.probe_cache).await {
+        Some(p) if p.duration > 0.0 => p,
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Could not probe media duration for segment-on-demand playlist",
+            )
+                .into_response();
+        }
+    };
+
+    let dir = config.cache_dir.join(key_for(file));
+    ensure_segment_cache_fresh(file, &dir, &probe).await;
+
+    playlist_response(generate_vod_playlist(probe.duration, SEGMENT_SECONDS))
+}
+
+/// `GET /hls/{enc}/seg-NNNNN.ts` in segment-on-demand mode.
+async fn serve_segment_segment(mgr: &TranscodeManager, file: &StdPath, seg: &str) -> Response {
+    let config = &mgr.config;
+    let dir = config.cache_dir.join(key_for(file));
+
+    let Some(seg_num) = parse_segment_number(seg) else {
+        return (StatusCode::BAD_REQUEST, "Invalid segment name").into_response();
+    };
+    // Canonical on-disk name (ffmpeg writes zero-padded; the playlist requests
+    // the same name), so a short request name never misses a padded file.
+    let seg_path = dir.join(format!("seg-{seg_num:05}.ts"));
+
+    // Fast path: already transcoded.
+    if tokio::fs::try_exists(&seg_path).await.unwrap_or(false) {
+        let resp = read_segment(&seg_path).await;
+        maybe_prefetch_next_window(mgr, file, &dir, seg_num);
+        return resp;
+    }
+
+    // Reject requests past the end of media (defensive; the playlist never lists
+    // these, so well-behaved players won't ask).
+    if let Some(m) = load_manifest(&dir).await
+        && (seg_num as f64) * SEGMENT_SECONDS as f64 >= m.duration
+    {
+        return (StatusCode::NOT_FOUND, "Segment past end of media").into_response();
+    }
+
+    // Kick off (or join) the window transcode that will produce this segment.
+    let win_start = window_start(seg_num);
+    if let Err(e) = ensure_window(mgr, file, &dir, win_start).await {
+        tracing::error!(file = %file.display(), "Failed to start window transcode: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to start segment transcode")
+            .into_response();
+    }
+
+    // Wait for our segment to land on disk.
+    let deadline = Instant::now() + WINDOW_WAIT;
+    loop {
+        if tokio::fs::try_exists(&seg_path).await.unwrap_or(false) {
+            let resp = read_segment(&seg_path).await;
+            maybe_prefetch_next_window(mgr, file, &dir, seg_num);
+            return resp;
+        }
+        if Instant::now() >= deadline {
+            log_window_failure(&dir, win_start, file).await;
+            return (StatusCode::SERVICE_UNAVAILABLE, "Segment not produced in time")
+                .into_response();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Read a finished segment file into a response.
+async fn read_segment(path: &StdPath) -> Response {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "video/mp2t")],
+            Body::from(bytes),
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Segment not ready").into_response(),
+    }
+}
+
+/// Start the window transcode for `win_start` unless one is already running.
+/// Deduplicates via the `windows` set, acquires a concurrency permit for the
+/// (short) lifetime of the job, and spawns a monitor task that releases the
+/// permit and clears the in-flight marker when ffmpeg exits.
+async fn ensure_window(
+    mgr: &TranscodeManager,
+    file: &StdPath,
+    dir: &StdPath,
+    win_start: u32,
+) -> std::io::Result<()> {
+    let wkey = format!("{}:{}", key_for(file), win_start);
+
+    // Claim the window (or bail if someone else already owns it).
+    {
+        let mut windows = mgr.windows.lock().await;
+        if windows.contains(&wkey) {
+            return Ok(());
+        }
+        windows.insert(wkey.clone());
+    }
+
+    // Acquire a permit (may queue if we are at the concurrency limit). The
+    // windows lock is already released, so other requests for this window see
+    // the claim and just wait for the segment to appear.
+    let permit = match mgr.semaphore.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => {
+            mgr.windows.lock().await.remove(&wkey);
+            return Err(std::io::Error::other("transcode semaphore closed"));
+        }
+    };
+
+    tokio::fs::create_dir_all(dir).await?;
+
+    let bitrate = bitrate_for(probe_height(mgr, file).await);
+    let log = std::fs::File::create(dir.join(format!("ffmpeg-win{win_start:05}.log")))?;
+    let mut cmd = build_window_command(&mgr.config, file, dir, win_start, bitrate);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log))
+        .kill_on_drop(true);
+
+    match cmd.spawn() {
+        Ok(mut child) => {
+            let windows = mgr.windows.clone();
+            tokio::spawn(async move {
+                // Hold the permit until ffmpeg exits, then release it + the claim.
+                let _permit = permit;
+                let _ = child.wait().await;
+                windows.lock().await.remove(&wkey);
+            });
+            Ok(())
+        }
+        Err(e) => {
+            drop(permit);
+            mgr.windows.lock().await.remove(&wkey);
+            Err(e)
+        }
+    }
+}
+
+/// When the last segment of a window is served, eagerly start the next window so
+/// continuous playback doesn't stall at the window boundary. Bounded: only the
+/// immediately-following window of the file currently being watched.
+fn maybe_prefetch_next_window(mgr: &TranscodeManager, file: &StdPath, dir: &StdPath, seg_num: u32) {
+    if seg_num != window_start(seg_num) + WINDOW_SEGMENTS - 1 {
+        return;
+    }
+    let next_start = seg_num + 1;
+    let mgr = mgr.clone();
+    let file = file.to_path_buf();
+    let dir = dir.to_path_buf();
+    tokio::spawn(async move {
+        // Skip if the next window is past the end of media.
+        if let Some(m) = load_manifest(&dir).await
+            && (next_start as f64) * SEGMENT_SECONDS as f64 >= m.duration
+        {
+            return;
+        }
+        // Skip if already produced.
+        if tokio::fs::try_exists(dir.join(format!("seg-{next_start:05}.ts")))
+            .await
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let _ = ensure_window(&mgr, &file, &dir, next_start).await;
+    });
+}
+
+/// Probe the source height for bitrate selection (falls back to 720).
+async fn probe_height(mgr: &TranscodeManager, file: &StdPath) -> u32 {
+    probe::probe(&mgr.config.ffprobe, file, &mgr.probe_cache)
+        .await
+        .map(|p| p.height)
+        .unwrap_or(720)
+}
+
+/// Build the ffmpeg command that transcodes one window of `WINDOW_SEGMENTS`
+/// segments starting at segment `win_start`.
+///
+/// Crucial flags (validated against ffmpeg 8.x): `-ss win_start*6` seeks to the
+/// window start (resetting output PTS to 0); `-output_ts_offset win_start*6`
+/// shifts the output back onto the global timeline; `-muxpreload 0 -muxdelay 0`
+/// removes the MPEG-TS initial-PTS so segment N's video PTS lands exactly on
+/// `6*N`; `-force_key_frames expr:gte(t,n_forced*6)` forces a keyframe at every
+/// 6s boundary so segments are exactly 6s and independently decodable; and
+/// `-start_number win_start` names the files `seg-{win_start..}.ts`.
+fn build_window_command(
+    config: &Config,
+    file: &StdPath,
+    dir: &StdPath,
+    win_start: u32,
+    bitrate: &str,
+) -> Command {
+    let offset = (win_start * SEGMENT_SECONDS).to_string();
+    let window_secs = (WINDOW_SEGMENTS * SEGMENT_SECONDS).to_string();
+
+    let mut cmd = Command::new(&config.ffmpeg);
+    cmd.arg("-hide_banner").arg("-loglevel").arg("warning");
+
+    let profile = profile_for_encoder(&config.encoder);
+    if let Some(hw) = profile.hwaccel {
+        cmd.arg("-hwaccel").arg(hw);
+    }
+
+    cmd.arg("-ss")
+        .arg(&offset)
+        .arg("-i")
+        .arg(file)
+        .arg("-t")
+        .arg(&window_secs)
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-map")
+        .arg("0:a:0?")
+        .arg("-c:v")
+        .arg(&config.encoder)
+        .arg("-profile:v")
+        .arg("high")
+        .arg("-b:v")
+        .arg(bitrate);
+
+    apply_encoder_specific_flags(&mut cmd, &profile, bitrate);
+
+    cmd.arg("-force_key_frames")
+        .arg(format!("expr:gte(t,n_forced*{SEGMENT_SECONDS})"))
+        .arg("-tag:v")
+        .arg("avc1")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("160k")
+        .arg("-ac")
+        .arg("2")
+        // Remove the MPEG-TS initial PTS so seg N's PTS == 6*N exactly.
+        .arg("-muxpreload")
+        .arg("0")
+        .arg("-muxdelay")
+        .arg("0")
+        .arg("-f")
+        .arg("hls")
+        .arg("-hls_time")
+        .arg(SEGMENT_SECONDS.to_string())
+        .arg("-hls_flags")
+        .arg("independent_segments+temp_file")
+        .arg("-hls_playlist_type")
+        .arg("vod")
+        .arg("-hls_list_size")
+        .arg("0")
+        .arg("-start_number")
+        .arg(win_start.to_string())
+        .arg("-output_ts_offset")
+        .arg(&offset)
+        .arg("-hls_segment_filename")
+        .arg(dir.join("seg-%05d.ts"))
+        // ffmpeg's own per-window playlist; we serve our generated VOD playlist
+        // instead, so this is a throwaway it needs as the output target.
+        .arg(dir.join(format!(".win{win_start:05}.m3u8")));
+
+    cmd
+}
+
+/// On a window-transcode timeout, surface the tail of its ffmpeg log.
+async fn log_window_failure(dir: &StdPath, win_start: u32, file: &StdPath) {
+    if let Ok(bytes) = tokio::fs::read(dir.join(format!("ffmpeg-win{win_start:05}.log"))).await {
+        let tail = String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(4096)..]);
+        tracing::error!(
+            file = %file.display(),
+            window = win_start,
+            "Segment-on-demand window transcode timed out. ffmpeg log tail:\n{}",
+            tail
+        );
     }
 }
 
@@ -740,6 +1108,8 @@ async fn dir_size(dir: &StdPath) -> u64 {
 pub struct TranscodeStatus {
     pub active_transcodes: usize,
     pub max_concurrent: usize,
+    /// In-flight segment-on-demand window transcodes (#6). Always 0 in linear mode.
+    pub active_segment_windows: usize,
     pub sessions: Vec<SessionInfo>,
 }
 
@@ -766,9 +1136,12 @@ pub async fn status_handler(State(state): State<AppState>) -> impl IntoResponse 
     // Sort by most recently accessed first
     infos.sort_by_key(|i| i.last_access_secs_ago);
 
+    let active_segment_windows = mgr.windows.lock().await.len();
+
     let status = TranscodeStatus {
         active_transcodes: sessions.len(),
         max_concurrent: mgr.config.max_concurrent_transcodes,
+        active_segment_windows,
         sessions: infos,
     };
 
@@ -817,8 +1190,140 @@ pub async fn ffmpeg_log_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::{bitrate_for, generate_vod_playlist, is_segment_name, load_manifest, write_manifest, CacheManifest, validate_cached_transcode};
+    use super::{
+        bitrate_for, build_window_command, generate_vod_playlist, is_segment_name, load_manifest,
+        parse_segment_number, window_start, write_manifest, CacheManifest, validate_cached_transcode,
+    };
     use std::time::UNIX_EPOCH;
+
+    #[test]
+    fn window_start_snaps_to_grid() {
+        // WINDOW_SEGMENTS = 5
+        assert_eq!(window_start(0), 0);
+        assert_eq!(window_start(4), 0);
+        assert_eq!(window_start(5), 5);
+        assert_eq!(window_start(9), 5);
+        assert_eq!(window_start(12), 10);
+        assert_eq!(parse_segment_number("seg-00012.ts"), Some(12));
+        assert_eq!(parse_segment_number("seg-00012.m4s"), Some(12));
+        assert_eq!(parse_segment_number("seg-7.ts"), Some(7));
+        assert_eq!(parse_segment_number("index.m3u8"), None);
+    }
+
+    #[test]
+    fn window_command_has_alignment_flags() {
+        let config = crate::config::Config::test_default(std::path::PathBuf::from("/tmp/root"));
+        // window starting at segment 5 -> offset 30s; 5 segments * 6s -> -t 30
+        let cmd = build_window_command(
+            &config,
+            std::path::Path::new("/tmp/movie.mkv"),
+            std::path::Path::new("/tmp/cache/abc"),
+            5,
+            "3M",
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let after = |flag: &str| -> Option<String> {
+            args.iter()
+                .position(|a| a == flag)
+                .and_then(|i| args.get(i + 1).cloned())
+        };
+
+        assert_eq!(after("-ss").as_deref(), Some("30"));
+        assert_eq!(after("-output_ts_offset").as_deref(), Some("30"));
+        assert_eq!(after("-start_number").as_deref(), Some("5"));
+        assert_eq!(after("-t").as_deref(), Some("30"));
+        assert_eq!(after("-muxpreload").as_deref(), Some("0"));
+        assert_eq!(after("-muxdelay").as_deref(), Some("0"));
+        assert_eq!(
+            after("-force_key_frames").as_deref(),
+            Some("expr:gte(t,n_forced*6)")
+        );
+        assert_eq!(
+            after("-hls_flags").as_deref(),
+            Some("independent_segments+temp_file")
+        );
+        // test_default uses h264_videotoolbox -> hardware decode flag present.
+        assert!(args.iter().any(|a| a == "-hwaccel"));
+    }
+
+    /// End-to-end check that a windowed transcode produces correctly-named
+    /// segments whose timestamps land on the global timeline (seg N -> ~6*N).
+    /// Requires ffmpeg + ffprobe on PATH; run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires ffmpeg/ffprobe on PATH"]
+    async fn window_transcode_produces_timeline_aligned_segments() {
+        use crate::{config::Config, probe};
+        use std::sync::Arc;
+
+        let tmp = std::env::temp_dir().join(format!("theia_seg_it_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let source = tmp.join("source.mp4");
+
+        // 60s synthetic source (libx264 so the test is portable across platforms).
+        let gen_status = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+                "-t", "60", "-c:v", "libx264", "-preset", "ultrafast",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+            ])
+            .arg(&source)
+            .status()
+            .expect("run ffmpeg");
+        assert!(gen_status.success(), "failed to generate synthetic source");
+
+        let mut config = Config::test_default(tmp.clone());
+        config.encoder = "libx264".to_string();
+        config.cache_dir = tmp.join("cache");
+        config.transcode_mode = "segment".to_string();
+        let config = Arc::new(config);
+        let mgr = super::TranscodeManager::new(config.clone(), probe::new_cache());
+
+        let dir = config.cache_dir.join(super::key_for(&source));
+        // Mid-stream window starting at segment 5 (t = 30s).
+        super::ensure_window(&mgr, &source, &dir, 5).await.unwrap();
+
+        let seg = dir.join("seg-00005.ts");
+        let mut produced = false;
+        for _ in 0..200 {
+            if tokio::fs::try_exists(&seg).await.unwrap_or(false) {
+                produced = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(produced, "seg-00005.ts was not produced");
+
+        // seg-5's first video PTS must be ~30.0 (global timeline alignment).
+        let out = std::process::Command::new("ffprobe")
+            .args([
+                "-hide_banner", "-v", "error", "-select_streams", "v",
+                "-show_entries", "packet=pts_time", "-of", "csv=p=0",
+            ])
+            .arg(&seg)
+            .output()
+            .expect("run ffprobe");
+        let pts: f64 = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(',')
+            .parse()
+            .unwrap_or(-1.0);
+        assert!(
+            (pts - 30.0).abs() < 0.2,
+            "seg-5 first PTS should be ~30.0, got {pts}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn segment_names_are_strictly_validated() {

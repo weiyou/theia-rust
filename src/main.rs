@@ -39,10 +39,16 @@ async fn main() {
         .init();
 
     if config.is_segment_on_demand() {
-        tracing::warn!(
-            "transcode_mode = \"segment\" is reserved/experimental and not yet implemented \
-             (see issue #6); serving with the current linear event playlist instead."
+        tracing::info!(
+            "transcode_mode = \"segment\": segment-on-demand HLS enabled (experimental, #6) — \
+             arbitrary seeks start fast; segments are transcoded on first request."
         );
+        if config.uses_fmp4_segments() {
+            tracing::warn!(
+                "hls_segment_format = \"fmp4\" is not yet supported in segment mode; \
+                 using MPEG-TS (.ts) segments."
+            );
+        }
     }
 
     if !config.root.exists() {

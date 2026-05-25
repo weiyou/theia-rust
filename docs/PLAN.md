@@ -63,11 +63,14 @@ ffmpeg writes an `event` HLS playlist + TS segments to `cache_dir/<hash>/`:
 Playlist requests poll until the first `.ts` appears; segments are served from the cache dir
 (name strictly validated).
 
-**Known limitation (v0.3)**: This is a *linear* transcode from t=0. The playlist only
-contains segments that ffmpeg has already produced. Seeking works well within the
-already-transcoded prefix (especially with fast HW encoding), but arbitrary seeks on
-long files may require waiting for ffmpeg to reach that point. True segment-on-demand
-is tracked as a future increment (see issues and roadmap below).
+**Linear vs segment mode**: The default (`transcode_mode = "linear"`) is a single transcode
+from t=0; the playlist only contains segments ffmpeg has already produced, so arbitrary seeks
+on long files wait for ffmpeg to reach that point. `transcode_mode = "segment"` (#6, implemented,
+experimental) serves a complete VOD playlist up front and transcodes on demand in fixed windows
+(5 × 6s) — seeking anywhere starts in ~1–2s. Each window seeks with `-ss`, forces a keyframe
+every 6s, and uses `-output_ts_offset` + `-muxpreload/-muxdelay 0` so segment N's PTS is exactly
+`6·N`; windows are deduplicated, bounded by the concurrency limit, and the next window is
+prefetched for smooth continuous playback. MPEG-TS only for now.
 
 A lightweight `manifest.json` (source mtime/size + probe data) is being added as part
 of the P0 cache-correctness work so that stale transcodes are invalidated when the
@@ -80,17 +83,22 @@ Optional `tls` feature: axum-server (tls-rustls). Runtime: ffmpeg + ffprobe on P
 
 [Testing]
 Unit tests: path encode/decode + traversal containment (`scan.rs`); segment-name validation,
-bitrate selection, manifest round-trip + stale-source detection, VOD playlist generation, and
-the concurrency-limit semaphore (`transcode.rs`).
+bitrate selection, manifest round-trip + stale-source detection, VOD playlist generation,
+the concurrency-limit semaphore, segment-window grid math, and the on-demand window ffmpeg
+command (`-ss`/`-output_ts_offset`/`-muxpreload`/forced keyframes) (`transcode.rs`).
 
 Router integration tests (`src/main.rs` `#[cfg(test)]`): drive the real `build_app` router via
 `tower::oneshot` to verify auth enforcement (401 / `WWW-Authenticate`), the `/login` exemption,
 wrong-password rejection, and an authenticated directory listing — no socket or ffmpeg required,
 so they run anywhere. (Bin-only crate, so these live in-crate rather than under `tests/`.)
 
+An `#[ignore]`'d ffmpeg-backed test (`window_transcode_produces_timeline_aligned_segments`,
+run with `cargo test -- --ignored`) generates a synthetic source, runs a mid-stream window
+transcode, and asserts via `ffprobe` that segment N's PTS lands on `6·N` — the core correctness
+guarantee of segment mode.
+
 A basic CI workflow runs `cargo test + clippy` on PRs and pushes (see `.github/workflows/ci.yml`).
-An ffmpeg-backed smoke test that exercises a real HLS transcode end-to-end is the remaining
-stretch goal in issue #7. See the "✅ Verification" section in README.md for the manual test matrix.
+See the "✅ Verification" section in README.md for the manual test matrix.
 
 ## Current Status & Known Gaps (Post-v0.3 Evaluation)
 
@@ -104,13 +112,14 @@ and several robustness/UX gaps. Work is tracked in the following GitHub issues:
 - **#4 (P1)**: No limit on concurrent transcodes → resource exhaustion risk on NAS / multi-user.
 - **#5 (P1)**: Transcode errors are opaque (no way to surface `ffmpeg.log` or actionable messages).
 - **#6 (P2 / Architecture)**: Segment-on-demand transcoding for instant arbitrary seeking on long files.
-  **Status: open / not implemented.** Groundwork is in place — a `transcode_mode` config flag
-  (`"linear"` | `"segment"`) and a unit-tested `generate_vod_playlist()` helper — but the actual
-  on-demand per-segment transcode path is not built. Selecting `"segment"` today logs a warning
-  and falls back to linear. A correct implementation still needs: per-segment ffmpeg with proper
-  timestamp offset (`-output_ts_offset`/`-copyts`) and keyframe alignment, the per-segment work
-  guarded by the concurrency semaphore (#4), playlist caching + stale-cache integration (#3),
-  and fMP4 (#8) support. See the issue for the design.
+  **Status: implemented (experimental), MPEG-TS only.** `transcode_mode = "segment"` serves a full VOD
+  playlist up front and transcodes on demand in fixed windows (5 × 6s). Each window seeks with `-ss`,
+  forces a keyframe every 6s, and offsets timestamps (`-output_ts_offset`, `-muxpreload/-muxdelay 0`)
+  so segment N's PTS is exactly `6·N` and independently-transcoded windows stitch together seamlessly
+  (verified: adjacent windows' segments are exactly one frame interval apart). Windows are deduplicated,
+  each holds a concurrency permit only while running (#4), and the next window is prefetched for smooth
+  continuous playback. Remaining: fMP4 (#8) support in this mode, and audio-overlap to remove the small
+  constant sub-frame A/V skew at window boundaries.
 - **#7**: Testing, CI, and docs gaps for the transcoding feature (integration coverage, PR smoke jobs,
   reproducible verification steps in README).
 
@@ -120,14 +129,11 @@ See the session evaluation plan for the full analysis, repro steps, and recommen
 
 ### High-Priority Transcoding Evolution
 1. **Apple Silicon (M4+) ffmpeg improvements** (#8): Hardware decode (`-hwaccel videotoolbox`), dynamic rate control with headroom, `-realtime` mode, and optional fMP4 output. One of the highest-impact performance wins on M-series Macs (dramatically lower CPU usage).
-2. **Segment-on-demand transcoding** (see #6): **Not yet implemented.** Groundwork only —
-   the `transcode_mode = "segment"` config flag and a unit-tested `generate_vod_playlist()`
-   helper exist; selecting the mode currently warns and falls back to linear.
-   - To build: serve a complete VOD playlist upfront, then transcode each requested segment
-     on demand via a short ffmpeg `-ss` invocation, with correct timestamp offsets
-     (`-output_ts_offset`/`-copyts`) and keyframe alignment so segments line up with the playlist.
-   - Each on-demand transcode must run under the concurrency semaphore (#4), and the path must
-     integrate with stale-cache invalidation (#3) and fMP4 output (#8).
+2. **Segment-on-demand transcoding** (see #6): **Implemented (experimental, MPEG-TS only).**
+   `transcode_mode = "segment"` serves a complete VOD playlist upfront and transcodes on demand in
+   fixed windows (5 × 6s); a seek anywhere starts in ~1–2s and re-watched regions are cache hits.
+   - Remaining: fMP4 (#8) in segment mode; audio-overlap to remove the small constant sub-frame
+     A/V skew at window boundaries; tunable window size.
 3. **Cache correctness + manifest** (#3): Lightweight `manifest.json` per cache dir.
 
 ### UX Polish

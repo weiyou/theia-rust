@@ -86,8 +86,8 @@ max_concurrent_transcodes = 4       # How many videos can transcode at once (def
                                    # you can go higher (6–8) on M3/M4 Pro/Max machines.
 hls_segment_format = "ts"           # "ts" (legacy MPEG-TS, best compatibility with older devices like old iPads)
                                    # "fmp4" (modern fragmented MP4, better on recent clients & Apple Silicon)
-transcode_mode = "linear"           # "linear" (current event playlist from t=0). "segment" is RESERVED for
-                                   # future per-segment on-demand seeking (#6) and is not yet implemented.
+transcode_mode = "linear"           # "linear" (event playlist from t=0) or "segment" (on-demand per-segment
+                                   # transcoding for fast arbitrary seeking on long files — experimental, #6).
 extensions = ["mp4", "m4v", "mov", "webm", "mkv", "avi", "ts", "flv"]
 ```
 
@@ -98,8 +98,8 @@ CLI flags (`--root`, `--port`, `--tls-cert`, `--tls-key`) override the config fi
 - `"fmp4"`: Uses modern fragmented MP4 segments (`.m4s`). Can provide slightly better performance and seeking on newer clients and Apple Silicon Macs, but may not play on some older hardware.
 
 **Note on `transcode_mode`**:
-- `"linear"` (default): The behavior described above — one long ffmpeg process produces a growing event playlist. Seeking works within already-generated segments.
-- `"segment"`: **Reserved / not yet implemented.** This is intended for true segment-on-demand seeking (serve a complete VOD playlist upfront and transcode individual segments on demand for fast arbitrary seeking on long files — see [issue #6](https://github.com/weiyou/theia-rust/issues/6)). Setting it today logs a warning and falls back to `"linear"`.
+- `"linear"` (default): One long ffmpeg process produces a growing event playlist from the start of the file. Best for "play from the beginning"; seeking only works within the prefix that has already been transcoded, so jumping near the end of a long file means waiting for ffmpeg to catch up.
+- `"segment"` (experimental, [issue #6](https://github.com/weiyou/theia-rust/issues/6)): **Segment-on-demand.** Theia serves a complete VOD playlist (every segment listed up front) immediately, then transcodes each segment on first request. A seek to any point in a multi-hour file starts within a couple of seconds, and re-watched regions are served from cache. How it works: requests are snapped to a fixed grid of windows (5 × 6s); one short ffmpeg job per window seeks to the window start, forces a keyframe every 6s, and offsets timestamps (`-output_ts_offset`, `-muxpreload/-muxdelay 0`) so segment *N*'s PTS lands exactly on `6·N` — making segments from independently-transcoded windows line up seamlessly. Each window job is bounded by `max_concurrent_transcodes`. Notes: segments are MPEG-TS only in this mode (`hls_segment_format = "fmp4"` is ignored, with a warning); there is a small, constant sub-frame audio interleave skew at window boundaries that players tolerate.
 
 When using `h264_videotoolbox` (or other `*_videotoolbox` encoders) on Apple Silicon, Theia now enables hardware decoding and improved rate control (with headroom) for significantly lower CPU usage. See GitHub issue #8 for details.
 
@@ -200,10 +200,18 @@ Use a clean `~/Theia_Home` (or `--root /tmp/theia-test`) and `ffmpeg` on PATH.
 
 3. **Seeking & Long-Form Behavior**
    - Use a longer source (> 10 min).
-   - With `transcode_mode = "linear"` (the only mode today), play then seek far forward (e.g. 80%).
-   - Note the buffering time — this demonstrates the linear event playlist limitation that the
-     planned segment-on-demand mode (`transcode_mode = "segment"`, issue #6) is meant to solve.
-     That mode is not implemented yet; selecting it logs a warning and falls back to linear.
+   - With `transcode_mode = "linear"` (default), play then seek far forward (e.g. 80%) and note the
+     buffering time — this is the linear event-playlist limitation.
+   - Set `transcode_mode = "segment"` (issue #6) and repeat: the seek should start within a couple of
+     seconds. You can verify directly against the running server:
+     ```sh
+     # complete VOD playlist served immediately
+     curl -s 'http://USER:PASS@localhost:32450/hls/<encoded-path>/index.m3u8'
+     # a deep segment is produced on demand; segment N's PTS lands on 6*N
+     curl -s -o seg.ts 'http://USER:PASS@localhost:32450/hls/<encoded-path>/seg-00012.ts'
+     ffprobe -v error -select_streams v -show_entries packet=pts_time -of csv=p=0 seg.ts | head -1  # ~72.0
+     ```
+   - `GET /status` reports `active_segment_windows` (in-flight on-demand window transcodes).
 
 4. **Lifecycle & Resources**
    - Start several H264/AAC transcodes.
@@ -258,7 +266,7 @@ See [PLAN.md](docs/PLAN.md) for the living architecture document (updated after 
 v0.3 HLS transcoding evaluation) and the full roadmap. Key follow-up work is tracked
 in GitHub issues:
 - [#3](https://github.com/weiyou/theia-rust/issues/3) — P0 stale cache invalidation + source manifest (completed in this prototype)
-- [#6](https://github.com/weiyou/theia-rust/issues/6) — Segment-on-demand for instant arbitrary seeking (open; `transcode_mode` config flag + a VOD-playlist generator are in place as groundwork, the on-demand transcode path is not yet built)
+- [#6](https://github.com/weiyou/theia-rust/issues/6) — Segment-on-demand for instant arbitrary seeking (implemented, experimental; enable with `transcode_mode = "segment"`, MPEG-TS only)
 - [#4](https://github.com/weiyou/theia-rust/issues/4), [#5](https://github.com/weiyou/theia-rust/issues/5), [#7](https://github.com/weiyou/theia-rust/issues/7) — concurrency limits, error visibility, and testing/CI improvements (significant progress made)
 
 Other planned enhancements include:
