@@ -28,7 +28,7 @@ pub struct Args {
     #[arg(long)]
     pub tls_key: Option<PathBuf>,
 
-    /// Maximum concurrent transcodes (overrides config file). Default: 2
+    /// Maximum concurrent transcodes (overrides config file). Default: 4
     #[arg(long = "max-transcodes")]
     pub max_transcodes: Option<usize>,
 }
@@ -69,7 +69,7 @@ impl Default for FileConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            max_concurrent_transcodes: 2,
+            max_concurrent_transcodes: 4, // default raised to 4 thanks to hardware decode on Apple Silicon
             hls_segment_format: "ts".to_string(), // "ts" = legacy MPEG-TS (best compatibility), "fmp4" = modern fragmented MP4
             transcode_mode: "linear".to_string(), // "linear" (current) or "segment" (future on-demand)
         }
@@ -90,7 +90,8 @@ pub struct Config {
     pub encoder: String,
     pub extensions: Vec<String>,
     /// Maximum number of concurrent ffmpeg transcodes allowed.
-    /// Additional requests queue (fairly) until a slot is free. Default: 2.
+    /// Additional requests queue (fairly) until a slot is free.
+    /// Default: 4 (raised thanks to efficient hardware decode + encode on Apple Silicon).
     pub max_concurrent_transcodes: usize,
     /// "ts" (legacy MPEG-TS, best compatibility with older devices)
     /// or "fmp4" (modern fragmented MP4, better on recent clients & Apple Silicon)
@@ -184,4 +185,28 @@ fn home_join(child: &str) -> PathBuf {
     dirs::home_dir()
         .expect("Could not find home directory")
         .join(child)
+}
+
+#[cfg(test)]
+impl Config {
+    /// Minimal config for integration tests.
+    pub fn test_default(root: PathBuf) -> Self {
+        Self {
+            username: "test".to_string(),
+            password: "test".to_string(),
+            port: 0,
+            root,
+            ffmpeg: PathBuf::from("ffmpeg"),
+            ffprobe: PathBuf::from("ffprobe"),
+            cache_dir: std::env::temp_dir().join("theia-test-cache"),
+            cache_max_bytes: 100 * 1024 * 1024, // 100MB for tests
+            encoder: "h264_videotoolbox".to_string(),
+            extensions: vec!["mp4".to_string(), "mkv".to_string()],
+            max_concurrent_transcodes: 1,
+            hls_segment_format: "ts".to_string(),
+            transcode_mode: "linear".to_string(),
+            tls_cert: None,
+            tls_key: None,
+        }
+    }
 }

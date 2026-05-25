@@ -31,3 +31,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
 
 [features]
 tls = ["dep:axum-server"]
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"

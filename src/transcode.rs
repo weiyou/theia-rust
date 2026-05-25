@@ -54,7 +54,7 @@ struct Session {
 /// Lightweight manifest stored alongside each cached HLS directory.
 /// Used for stale-cache detection (P0) and as a foundation for future
 /// smarter features (segment-on-demand, better eviction, etc.).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct CacheManifest {
     /// Unix timestamp seconds of the source file's mtime at transcode time.
     source_mtime_unix: u64,
@@ -196,6 +196,107 @@ async fn source_matches_manifest(file: &StdPath, m: &CacheManifest) -> bool {
     mtime == m.source_mtime_unix && meta.len() == m.source_size
 }
 
+/// Recommended rate control parameters for a hardware encoder family.
+#[derive(Clone, Copy, Debug)]
+struct RateControl {
+    maxrate_factor: f32,
+    bufsize_factor: f32,
+    qmin: i32,
+    qmax: i32,
+}
+
+impl Default for RateControl {
+    fn default() -> Self {
+        Self {
+            maxrate_factor: 1.15,
+            bufsize_factor: 2.0,
+            qmin: 15,
+            qmax: 32,
+        }
+    }
+}
+
+/// A small profile describing the recommended flags for a given encoder.
+/// This makes it easy to support new hardware backends (AMF, VAAPI, NVENC, etc.)
+/// without scattering `if encoder.contains(...)` checks everywhere.
+#[derive(Clone, Debug, Default)]
+struct EncoderProfile {
+    /// Recommended value for `-hwaccel`, if any.
+    /// The caller is responsible for emitting this early (before `-i`).
+    hwaccel: Option<&'static str>,
+    pix_fmt: Option<&'static str>,
+    realtime: bool,
+    rate_control: Option<RateControl>,
+}
+
+/// Build an `EncoderProfile` for the given encoder name.
+/// Rate-control factors are resolved against the target bitrate later,
+/// in `apply_encoder_specific_flags`.
+fn profile_for_encoder(encoder: &str) -> EncoderProfile {
+    if encoder.contains("videotoolbox") {
+        EncoderProfile {
+            hwaccel: Some("videotoolbox"),
+            pix_fmt: Some("yuv420p"),
+            realtime: true,
+            rate_control: Some(RateControl {
+                maxrate_factor: 1.2,
+                bufsize_factor: 2.4,
+                qmin: 15,
+                qmax: 32,
+            }),
+        }
+    } else if encoder.contains("amf") {
+        EncoderProfile {
+            hwaccel: Some("d3d11va"),
+            pix_fmt: Some("yuv420p"),
+            realtime: false,
+            rate_control: Some(RateControl {
+                maxrate_factor: 1.15,
+                bufsize_factor: 2.0,
+                qmin: 15,
+                qmax: 32,
+            }),
+        }
+    } else if encoder.contains("vaapi") {
+        EncoderProfile {
+            hwaccel: Some("vaapi"),
+            pix_fmt: Some("yuv420p"),
+            realtime: false,
+            rate_control: Some(RateControl {
+                maxrate_factor: 1.15,
+                bufsize_factor: 2.0,
+                qmin: 15,
+                qmax: 32,
+            }),
+        }
+    } else {
+        // Software or unknown encoder – no special hardware tweaks
+        EncoderProfile::default()
+    }
+}
+
+/// Apply an `EncoderProfile` to a ffmpeg command.
+/// This is the central place for all encoder-family specific flags.
+fn apply_encoder_specific_flags(cmd: &mut Command, profile: &EncoderProfile, bitrate: &str) {
+    if let Some(pf) = profile.pix_fmt {
+        cmd.arg("-pix_fmt").arg(pf);
+    }
+
+    if profile.realtime {
+        cmd.arg("-realtime").arg("1");
+    }
+
+    if let Some(rc) = profile.rate_control {
+        let maxrate = scale_bitrate(bitrate, rc.maxrate_factor);
+        let bufsize = scale_bitrate(bitrate, rc.bufsize_factor);
+
+        cmd.arg("-maxrate").arg(&maxrate);
+        cmd.arg("-bufsize").arg(&bufsize);
+        cmd.arg("-qmin").arg(rc.qmin.to_string());
+        cmd.arg("-qmax").arg(rc.qmax.to_string());
+    }
+}
+
 /// If a completed cache exists for this file, validate that the source has not
 /// changed since we built the transcode. Returns `true` if we can safely serve
 /// the cached playlist. On mismatch (or missing/invalid manifest) the directory
@@ -211,8 +312,8 @@ async fn validate_cached_transcode(
 
     // Check manifest + source mtime/size
     let manifest_ok = match load_manifest(dir).await {
-        Some(m) if source_matches_manifest(file, &m).await => true,
-        _ => false,
+        Some(m) => source_matches_manifest(file, &m).await,
+        None => false,
     };
 
     if !manifest_ok {
@@ -238,8 +339,10 @@ async fn validate_cached_transcode(
 
 async fn serve_playlist(state: &AppState, file: &StdPath, encoded_path: &str) -> Response {
     let mgr = &state.transcoder;
+    let config = &mgr.config;
+
     let key = key_for(file);
-    let dir = mgr.config.cache_dir.join(&key);
+    let dir = config.cache_dir.join(&key);
     let playlist = dir.join("index.m3u8");
 
     // Fast path: an existing session (or a validated completed cache) already has the playlist.
@@ -317,6 +420,43 @@ async fn read_playlist(playlist: &StdPath) -> Response {
         Ok(contents) => playlist_response(contents),
         Err(_) => (StatusCode::NOT_FOUND, "Playlist not found").into_response(),
     }
+}
+
+/// Generate a complete VOD-style HLS playlist (every segment listed up front,
+/// terminated by `#EXT-X-ENDLIST`) from a known duration.
+///
+/// This is a building block for the planned segment-on-demand mode (#6) and is
+/// intentionally NOT yet wired into request serving: a correct implementation
+/// also needs per-segment transcoding with proper timestamp offsets, keyframe
+/// alignment, concurrency limiting, and fMP4 support. Kept (with a unit test) so
+/// that work can build on a verified playlist generator. See issue #6.
+#[allow(dead_code)]
+pub fn generate_vod_playlist(duration: f64, segment_seconds: u32) -> String {
+    if duration <= 0.0 {
+        return "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXT-X-ENDLIST\n".to_string();
+    }
+
+    let mut playlist = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
+    playlist.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", segment_seconds));
+    playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+    playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+
+    let mut time = 0.0;
+    let mut seq = 0;
+
+    while time < duration {
+        let remaining = duration - time;
+        let seg_dur = remaining.min(segment_seconds as f64);
+
+        playlist.push_str(&format!("#EXTINF:{:.3},\n", seg_dur));
+        playlist.push_str(&format!("seg-{:05}.ts\n", seq));
+
+        time += segment_seconds as f64;
+        seq += 1;
+    }
+
+    playlist.push_str("#EXT-X-ENDLIST\n");
+    playlist
 }
 
 fn playlist_response(contents: String) -> Response {
@@ -403,7 +543,6 @@ async fn start_session(
 
     let log = std::fs::File::create(dir.join("ffmpeg.log"))?;
 
-    let is_videotoolbox = config.encoder.contains("videotoolbox");
     let use_fmp4 = config.uses_fmp4_segments();
 
     let segment_ext = if use_fmp4 { "m4s" } else { "ts" };
@@ -421,12 +560,11 @@ async fn start_session(
         .arg("-loglevel")
         .arg("warning");
 
-    // === Hardware decode on Apple Silicon (M1/M2/M3/M4) ===
-    // Use a simple `-hwaccel videotoolbox` for broad compatibility (including AV1).
-    // This still gives very large CPU savings on M-series Macs.
-    if is_videotoolbox {
-        cmd.arg("-hwaccel")
-            .arg("videotoolbox");
+    // Encoder-family profile (videotoolbox / amf / vaapi / software). Computed once
+    // and reused below; the hwaccel flag must be emitted *before* -i.
+    let profile = profile_for_encoder(&config.encoder);
+    if let Some(hw) = profile.hwaccel {
+        cmd.arg("-hwaccel").arg(hw);
     }
 
     cmd.arg("-i")
@@ -442,24 +580,8 @@ async fn start_session(
         .arg("-b:v")
         .arg(bitrate);
 
-    // Apple Silicon rate control — balanced for consistent bitrate with some headroom
-    if is_videotoolbox {
-        let maxrate = scale_bitrate(bitrate, 1.2);   // 20% headroom for quality on hard scenes
-        let bufsize = scale_bitrate(bitrate, 2.4);   // ~2x the maxrate for good buffer behavior
-
-        cmd.arg("-maxrate")
-            .arg(&maxrate)
-            .arg("-bufsize")
-            .arg(&bufsize)
-            .arg("-qmin")
-            .arg("15")
-            .arg("-qmax")
-            .arg("32")
-            .arg("-pix_fmt")
-            .arg("yuv420p")
-            .arg("-realtime")
-            .arg("1");
-    }
+    // Apply encoder-family specific flags (rate control, pix_fmt, realtime, etc.)
+    apply_encoder_specific_flags(&mut cmd, &profile, bitrate);
 
     cmd.arg("-tag:v")
         .arg("avc1")
@@ -568,13 +690,13 @@ async fn evict_cache(mgr: &TranscodeManager) {
 
         // Time-based cleanup: delete anything older than MAX_CACHE_AGE (3 hours)
         // even if we are still under the size limit.
-        if let Ok(age) = now.duration_since(accessed) {
-            if age > MAX_CACHE_AGE && !active.contains(&path) {
-                if tokio::fs::remove_dir_all(&path).await.is_ok() {
-                    // do not add to total / dirs
-                    continue;
-                }
-            }
+        if let Ok(age) = now.duration_since(accessed)
+            && age > MAX_CACHE_AGE
+            && !active.contains(&path)
+            && tokio::fs::remove_dir_all(&path).await.is_ok()
+        {
+            // do not add to total / dirs
+            continue;
         }
 
         total += size;
@@ -695,7 +817,7 @@ pub async fn ffmpeg_log_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::{bitrate_for, is_segment_name, load_manifest, write_manifest, CacheManifest, validate_cached_transcode};
+    use super::{bitrate_for, generate_vod_playlist, is_segment_name, load_manifest, write_manifest, CacheManifest, validate_cached_transcode};
     use std::time::UNIX_EPOCH;
 
     #[test]
@@ -710,6 +832,25 @@ mod tests {
         assert!(!is_segment_name("seg-1.ts/../../etc/passwd"));
         assert!(!is_segment_name("index.m3u8"));
         assert!(!is_segment_name("ffmpeg.log"));
+    }
+
+    #[test]
+    fn vod_playlist_covers_full_duration() {
+        // 13s at 6s segments => segments [0,6), [6,12), [12,13): 3 entries,
+        // the last one only 1s long, terminated by ENDLIST.
+        let pl = generate_vod_playlist(13.0, 6);
+        assert_eq!(pl.matches("#EXTINF:").count(), 3);
+        assert!(pl.contains("seg-00000.ts"));
+        assert!(pl.contains("seg-00002.ts"));
+        assert!(!pl.contains("seg-00003.ts"));
+        assert!(pl.contains("#EXTINF:1.000,"), "final partial segment should be 1s");
+        assert!(pl.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
+        assert!(pl.trim_end().ends_with("#EXT-X-ENDLIST"));
+
+        // A zero/unknown duration yields a valid but empty (terminated) playlist.
+        let empty = generate_vod_playlist(0.0, 6);
+        assert!(empty.contains("#EXT-X-ENDLIST"));
+        assert_eq!(empty.matches("#EXTINF:").count(), 0);
     }
 
     #[test]

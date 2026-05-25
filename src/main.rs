@@ -38,6 +38,13 @@ async fn main() {
         )
         .init();
 
+    if config.is_segment_on_demand() {
+        tracing::warn!(
+            "transcode_mode = \"segment\" is reserved/experimental and not yet implemented \
+             (see issue #6); serving with the current linear event playlist instead."
+        );
+    }
+
     if !config.root.exists() {
         std::fs::create_dir_all(&config.root).expect("Failed to create root directory");
     }
@@ -53,7 +60,18 @@ async fn main() {
         transcoder,
     };
 
-    let app = Router::new()
+    let app = build_app(state);
+
+    let addr: std::net::SocketAddr = ([0, 0, 0, 0], config.port).into();
+    println!("Serving {} on port {}", config.root.display(), config.port);
+    println!("Cache: {}", config.cache_dir.display());
+
+    serve(addr, app, &config).await;
+}
+
+/// Build the application router. Exposed for integration testing (issue #7).
+pub fn build_app(state: AppState) -> Router {
+    Router::new()
         .route("/login", get(auth::login_handler))
         .route("/", get(listing::directory_handler))
         .route("/meta/:enc", get(probe::meta_handler))
@@ -68,13 +86,7 @@ async fn main() {
             auth::basic_auth_middleware,
         ))
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
-
-    let addr: std::net::SocketAddr = ([0, 0, 0, 0], config.port).into();
-    println!("Serving {} on port {}", config.root.display(), config.port);
-    println!("Cache: {}", config.cache_dir.display());
-
-    serve(addr, app, &config).await;
+        .with_state(state)
 }
 
 #[cfg(feature = "tls")]
@@ -105,4 +117,94 @@ async fn serve_plain(addr: std::net::SocketAddr, app: Router, port: u16) {
     println!("Server running on http://localhost:{port}");
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Router-level integration tests (issue #7).
+///
+/// These drive the *real* `build_app` router via `tower::oneshot` — exercising
+/// the auth middleware and a handler end-to-end without binding a socket or
+/// invoking ffmpeg, so they run anywhere. They live in-crate because this is a
+/// binary-only crate: an external `tests/` file cannot reach `build_app` /
+/// `Config::test_default`. (An ffmpeg-backed smoke test of the HLS path is the
+/// remaining stretch goal in #7.)
+#[cfg(test)]
+mod tests {
+    use super::{build_app, AppState};
+    use crate::{config::Config, probe, transcode};
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use base64::Engine;
+    use http_body_util::BodyExt;
+    use std::sync::Arc;
+    use tower::ServiceExt; // for `oneshot`
+
+    fn test_state() -> AppState {
+        let root = std::env::temp_dir().join(format!("theia-it-root-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        let config = Arc::new(Config::test_default(root));
+        let probe_cache = probe::new_cache();
+        let transcoder = transcode::TranscodeManager::new(config.clone(), probe_cache.clone());
+        AppState {
+            config,
+            probe_cache,
+            transcoder,
+        }
+    }
+
+    fn basic_auth(user: &str, pass: &str) -> String {
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        format!("Basic {token}")
+    }
+
+    fn get(uri: &str, auth: Option<&str>) -> Request<Body> {
+        let mut b = Request::builder().uri(uri);
+        if let Some(a) = auth {
+            b = b.header(header::AUTHORIZATION, a);
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_requests_are_rejected() {
+        let res = build_app(test_state())
+            .oneshot(get("/", None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(res.headers().contains_key("www-authenticate"));
+    }
+
+    #[tokio::test]
+    async fn login_page_is_exempt_from_auth() {
+        let res = build_app(test_state())
+            .oneshot(get("/login", None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn wrong_password_is_rejected() {
+        let res = build_app(test_state())
+            .oneshot(get("/", Some(&basic_auth("test", "wrong"))))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn authenticated_directory_listing_succeeds() {
+        let res = build_app(test_state())
+            .oneshot(get("/", Some(&basic_auth("test", "test"))))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&body);
+        assert!(
+            html.contains("Theia"),
+            "authenticated request should render the library page"
+        );
+    }
 }
