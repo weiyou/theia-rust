@@ -79,13 +79,18 @@ serde_json, toml, tracing, tracing-subscriber, tower-http (trace), html-escape, 
 Optional `tls` feature: axum-server (tls-rustls). Runtime: ffmpeg + ffprobe on PATH.
 
 [Testing]
-Unit tests: path encode/decode + traversal containment (`scan.rs`), segment-name validation
-and bitrate selection (`transcode.rs`).
+Unit tests: path encode/decode + traversal containment (`scan.rs`); segment-name validation,
+bitrate selection, manifest round-trip + stale-source detection, VOD playlist generation, and
+the concurrency-limit semaphore (`transcode.rs`).
 
-The HLS transcoding paths currently have solid unit test coverage + manual verification.
-A basic CI workflow now runs `cargo test + clippy` on PRs and pushes (see `.github/workflows/ci.yml`).
-Full automated integration tests that exercise real `ffmpeg` transcoding are tracked in issue #7.
-See the expanded "✅ Verification" section in README.md for the current recommended manual test matrix.
+Router integration tests (`src/main.rs` `#[cfg(test)]`): drive the real `build_app` router via
+`tower::oneshot` to verify auth enforcement (401 / `WWW-Authenticate`), the `/login` exemption,
+wrong-password rejection, and an authenticated directory listing — no socket or ffmpeg required,
+so they run anywhere. (Bin-only crate, so these live in-crate rather than under `tests/`.)
+
+A basic CI workflow runs `cargo test + clippy` on PRs and pushes (see `.github/workflows/ci.yml`).
+An ffmpeg-backed smoke test that exercises a real HLS transcode end-to-end is the remaining
+stretch goal in issue #7. See the "✅ Verification" section in README.md for the manual test matrix.
 
 ## Current Status & Known Gaps (Post-v0.3 Evaluation)
 
@@ -99,10 +104,13 @@ and several robustness/UX gaps. Work is tracked in the following GitHub issues:
 - **#4 (P1)**: No limit on concurrent transcodes → resource exhaustion risk on NAS / multi-user.
 - **#5 (P1)**: Transcode errors are opaque (no way to surface `ffmpeg.log` or actionable messages).
 - **#6 (P2 / Architecture)**: Segment-on-demand transcoding for instant arbitrary seeking on long files.
-  A working prototype exists: full VOD playlist generation from duration, per-segment on-demand
-  generation with `-ss`, watched-time tracking (15 min wall-clock trigger), and lazy directory
-  pre-warming of the first ~12s of other non-H.264/AAC videos. Controlled by `transcode_mode = "segment"`.
-  Still experimental — see the issue for remaining polish items.
+  **Status: open / not implemented.** Groundwork is in place — a `transcode_mode` config flag
+  (`"linear"` | `"segment"`) and a unit-tested `generate_vod_playlist()` helper — but the actual
+  on-demand per-segment transcode path is not built. Selecting `"segment"` today logs a warning
+  and falls back to linear. A correct implementation still needs: per-segment ffmpeg with proper
+  timestamp offset (`-output_ts_offset`/`-copyts`) and keyframe alignment, the per-segment work
+  guarded by the concurrency semaphore (#4), playlist caching + stale-cache integration (#3),
+  and fMP4 (#8) support. See the issue for the design.
 - **#7**: Testing, CI, and docs gaps for the transcoding feature (integration coverage, PR smoke jobs,
   reproducible verification steps in README).
 
@@ -112,12 +120,14 @@ See the session evaluation plan for the full analysis, repro steps, and recommen
 
 ### High-Priority Transcoding Evolution
 1. **Apple Silicon (M4+) ffmpeg improvements** (#8): Hardware decode (`-hwaccel videotoolbox`), dynamic rate control with headroom, `-realtime` mode, and optional fMP4 output. One of the highest-impact performance wins on M-series Macs (dramatically lower CPU usage).
-2. **Segment-on-demand transcoding** (see #6): A working prototype is implemented.
-   - VOD playlist generation from duration.
-   - On-demand per-segment generation using short ffmpeg `-ss` invocations.
-   - Watched-time tracking + lazy directory pre-warming (first 10–15s of other non-H.264/AAC videos after 15 min of watching one title).
-   - Controlled via `transcode_mode = "segment"`.
-   Remaining work: full resume window protection, better integration with fMP4 output, polish on pre-warming, and production hardening.
+2. **Segment-on-demand transcoding** (see #6): **Not yet implemented.** Groundwork only —
+   the `transcode_mode = "segment"` config flag and a unit-tested `generate_vod_playlist()`
+   helper exist; selecting the mode currently warns and falls back to linear.
+   - To build: serve a complete VOD playlist upfront, then transcode each requested segment
+     on demand via a short ffmpeg `-ss` invocation, with correct timestamp offsets
+     (`-output_ts_offset`/`-copyts`) and keyframe alignment so segments line up with the playlist.
+   - Each on-demand transcode must run under the concurrency semaphore (#4), and the path must
+     integrate with stale-cache invalidation (#3) and fMP4 output (#8).
 3. **Cache correctness + manifest** (#3): Lightweight `manifest.json` per cache dir.
 
 ### UX Polish
