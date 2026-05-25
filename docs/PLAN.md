@@ -3,80 +3,158 @@
 # Implementation Plan - Current State & Future Features
 
 [Overview]
-Successfully rebuilt the Theia Swift app as a portable Rust CLI that serves MP4 files from a specified directory with directory listing, video streaming, and playlist capabilities. **FIXED 2GB LIMIT** - now streams any size video using 256MB chunked streaming instead of loading entire files into memory.
+Theia is a portable media streaming server in Rust (Axum + Tokio). It serves a directory of
+media files with a browsable HTML tree, constant-memory byte-range streaming, a per-folder
+"Play All" playlist, and basic auth. Its headline capability (landed in v0.3 on the
+`feat/theia-hls-transcoding` branch) is **on-demand transcoding**:
+a per-file **H264/AAC** button transcodes any source (notably VP9/AV1/Opus) to H.264/AAC and
+delivers it as **HLS**, which Safari plays natively with seeking. This is what lets
+VP9/AV1 content play on devices without VP9/AV1 hardware decode (e.g. a 2nd-gen iPad Pro).
+Transcoding shells out to `ffmpeg`/`ffprobe`; on Apple Silicon it uses the
+`h264_videotoolbox` hardware encoder, which runs faster than realtime.
 
-The implementation creates a single binary HTTP server using Axum framework that serves only MP4 files from ~/Theia_Home or a custom root directory specified via --root flag. It includes basic authentication for all routes except /login with proper WWW-Authenticate header for browser popup, a /login page with authentication instructions, an HTML directory tree view at root path without thumbnails, byte-range supported streaming for MP4 files at /stream/{encoded-path} with per-segment %2F encoding for nested paths, and a playlist feature at /playall/{encoded-folder-path} that auto-plays all MP4s in a folder sequentially. The server runs on port 32450 by default and prints the running message. All code is contained in single src/main.rs file. Dependencies include axum, tokio, walkdir, clap, dirs, base64, urlencoding, and async-stream for cross-platform compatibility, proper encoding, and unlimited-size streaming.
+> **2026 Evaluation Note**: A full code review of the v0.3 transcoding implementation
+> (Grok 4.3) is captured in the session plan and resulted in GitHub issues #3–#7.
+> The current design uses a linear "event" playlist (one ffmpeg from t=0 per file).
+> This delivers excellent "play from start" UX but has known limitations for arbitrary
+> seeking on long files and cache invalidation. See the new "Current Status & Known Gaps"
+> section below.
 
-[Types]
-Current data structures implemented in single main.rs file.
+[Architecture / Files]
+Code is split into focused modules under `src/`:
 
-- `MediaNode` enum: Variants `File { name: String, path: String }` and `Folder { name: String, path: String, children: Vec<MediaNode> }` for representing the file tree structure with encoded paths for links.
-- `AppState` struct: Contains `root_dir: PathBuf` for shared server state.
+- `main.rs` — module wiring, `AppState`, router, startup, plain/TLS serving.
+- `config.rs` — `Args` (clap) + `FileConfig` (TOML) merged into a resolved `Config`
+  (precedence CLI > config file > defaults). `Config::is_media()` gates the extension set.
+- `auth.rs` — `basic_auth_middleware` (config creds, constant-time compare via `subtle`),
+  exempts `/login`; `login_handler`.
+- `scan.rs` — `MediaNode` tree, `encode_path`/`decode_path`, `scan_media`, and
+  `resolve_within` (canonicalize + containment check that blocks `../` and absolute paths).
+- `listing.rs` — directory HTML (escaped names, size, lazy `/meta` badges, H264/AAC button)
+  and `playall_handler` (direct-stream playlist).
+- `stream.rs` — `stream_handler`: byte-range streaming in a fixed 256KB buffer; content type
+  by extension.
+- `probe.rs` — `Probe` struct, mtime-keyed cache, `probe()` (ffprobe JSON), `meta_handler`.
+- `transcode.rs` — `TranscodeManager`, HLS session lifecycle, `hls_handler`
+  (playlist + segment), bitrate selection, `is_segment_name` guard, and `spawn_sweeper`
+  (idle-session reaping + LRU cache eviction by `cache_max_bytes`).
+- `player.rs` — `play_handler`: full-screen HLS player (native Safari, hls.js fallback).
 
-[Files]
-Current file structure with all code in single main.rs.
+[State]
+`AppState { config: Arc<Config>, probe_cache: ProbeCache, transcoder: TranscodeManager }`.
+`ProbeCache = Arc<Mutex<HashMap<PathBuf,(SystemTime,Probe)>>>`.
+`TranscodeManager` holds `Arc<tokio::Mutex<HashMap<String, Session>>>` keyed by a hash of the
+canonical file path; each `Session` owns the ffmpeg `Child` (`kill_on_drop`) + `last_access`.
 
-- `theia-rust/Cargo.toml`: Dependencies axum = "0.7", tokio = { version = "1", features = ["full"] }, walkdir = "2", clap = { version = "4", features = ["derive"] }, dirs = "5", base64 = "0.21", urlencoding = "2".
-- `theia-rust/src/main.rs`: Complete server implementation including CLI parsing, auth middleware, directory scanning, HTML generation, streaming with byte-range support, and playlist functionality.
+[Routes]
+- `GET /` directory listing · `GET /login`
+- `GET /stream/{enc}` direct byte-range stream
+- `GET /meta/{enc}` cached ffprobe JSON
+- `GET /play/{enc}` HLS player page
+- `GET /hls/{enc}/index.m3u8` start/attach transcode, return playlist
+- `GET /hls/{enc}/seg-NNNNN.ts` (or .m4s) transcoded segment
+- `GET /playall/{enc}` direct-stream folder playlist
+- `GET /status` — live view of active transcodes and concurrency (new)
 
-[Functions]
-Current implementation functions in main.rs.
+[Transcode pipeline]
+ffmpeg writes an `event` HLS playlist + TS segments to `cache_dir/<hash>/`:
+`-c:v <encoder> -profile:v high -b:v <bitrate-by-height> -tag:v avc1 -c:a aac -b:a 160k
+-ac 2 -f hls -hls_time 6 -hls_flags independent_segments -hls_playlist_type event`.
+Playlist requests poll until the first `.ts` appears; segments are served from the cache dir
+(name strictly validated).
 
-- `main()`: Parse CLI args, set up app state, configure routes with auth middleware, start server.
-- `basic_auth_middleware()`: Tower middleware checking basic auth headers, exempting /login, returning 401 with WWW-Authenticate.
-- `login_handler()`: Returns HTML page with authentication instructions.
-- `directory_handler()`: Generates HTML directory tree from root, filtering MP4 files, with "▶ Play All" links for folders.
-- `stream_handler()`: Serves MP4 files with full byte-range support (206 responses).
-- `playall_handler()`: Scans folder for MP4 files, returns HTML page with JS auto-playing sequential videos.
-- `scan_media()`: Recursively scans directory tree, building MediaNode structure with encoded paths.
-- `build_html()`: Generates HTML for MediaNode tree with proper links.
-- `generate_html_listing()`: Creates full HTML page for directory listing.
-- `encode_path()`: URL-encodes paths with %2F separators for nested paths.
-- `decode_path()`: URL-decodes paths from URLs to filesystem paths.
+**Linear vs segment mode**: The default (`transcode_mode = "linear"`) is a single transcode
+from t=0; the playlist only contains segments ffmpeg has already produced, so arbitrary seeks
+on long files wait for ffmpeg to reach that point. `transcode_mode = "segment"` (#6, implemented,
+experimental) serves a complete VOD playlist up front and transcodes on demand in fixed windows
+(5 × 6s) — seeking anywhere starts in ~1–2s. Each window seeks with `-ss`, forces a keyframe
+every 6s, and uses `-output_ts_offset` + `-muxpreload/-muxdelay 0` so segment N's PTS is exactly
+`6·N`; windows are deduplicated, bounded by the concurrency limit, and the next window is
+prefetched for smooth continuous playback. MPEG-TS only for now.
 
-[Classes]
-No class-based structures as Rust uses structs and enums.
+A lightweight `manifest.json` (source mtime/size + probe data) is being added as part
+of the P0 cache-correctness work so that stale transcodes are invalidated when the
+source file changes.
 
 [Dependencies]
-Current dependencies in Cargo.toml.
-
-- axum = "0.7" for HTTP server framework.
-- tokio = { version = "1", features = ["full"] } for async runtime.
-- walkdir = "2" for directory traversal.
-- clap = { version = "4", features = ["derive"] } for CLI parsing.
-- dirs = "5" for cross-platform home directory.
-- base64 = "0.21" for auth decoding.
-- urlencoding = "2" for path encoding/decoding.
+axum, tokio (full), walkdir, clap, dirs, base64, urlencoding, async-stream, serde,
+serde_json, toml, tracing, tracing-subscriber, tower-http (trace), html-escape, subtle.
+Optional `tls` feature: axum-server (tls-rustls). Runtime: ffmpeg + ffprobe on PATH.
 
 [Testing]
-No tests implemented yet - server functionality verified manually.
+Unit tests: path encode/decode + traversal containment (`scan.rs`); segment-name validation,
+bitrate selection, manifest round-trip + stale-source detection, VOD playlist generation,
+the concurrency-limit semaphore, segment-window grid math, and the on-demand window ffmpeg
+command (`-ss`/`-output_ts_offset`/`-muxpreload`/forced keyframes) (`transcode.rs`).
 
-[Implementation Order]
-Completed implementation sequence.
+Router integration tests (`src/main.rs` `#[cfg(test)]`): drive the real `build_app` router via
+`tower::oneshot` to verify auth enforcement (401 / `WWW-Authenticate`), the `/login` exemption,
+wrong-password rejection, and an authenticated directory listing — no socket or ffmpeg required,
+so they run anywhere. (Bin-only crate, so these live in-crate rather than under `tests/`.)
 
-1. ✅ Update Cargo.toml with dependencies.
-2. ✅ Implement CLI argument parsing in main.rs.
-3. ✅ Create path encoding/decoding functions.
-4. ✅ Implement basic auth middleware with WWW-Authenticate.
-5. ✅ Create directory listing handler with HTML tree.
-6. ✅ Add streaming handler with byte-range support.
-7. ✅ Add playlist feature with /playall/ route.
-8. ✅ Integrate all in single main.rs and test.
+An `#[ignore]`'d ffmpeg-backed test (`window_transcode_produces_timeline_aligned_segments`,
+run with `cargo test -- --ignored`) generates a synthetic source, runs a mid-stream window
+transcode, and asserts via `ffprobe` that segment N's PTS lands on `6·N` — the core correctness
+guarantee of segment mode.
 
-## Next Possible Features (Priority Order)
+A basic CI workflow runs `cargo test + clippy` on PRs and pushes (see `.github/workflows/ci.yml`).
+See the "✅ Verification" section in README.md for the manual test matrix.
 
-1. **File Upload Support**: Add POST /upload route to upload MP4 files to folders, with auth and size limits.
-2. **File Deletion**: Add DELETE /stream/{encoded-path} route to remove files, with confirmation.
-3. **Search Functionality**: Add /search?q=query route returning filtered directory listing.
-4. **File Renaming**: Add PUT /stream/{encoded-path} with new name in body.
-5. **Folder Creation**: Add POST /create-folder with folder name.
-6. **File Move/Copy**: Add routes to move files between folders.
-7. **Metadata Display**: Show file size, duration, resolution in directory listing.
-8. **Sorting Options**: Add query params for sorting by name, date, size.
-9. **Pagination**: For large directories, add page navigation.
-10. **HTTPS Support**: Add TLS certificate options for secure serving.
-11. **Rate Limiting**: Prevent abuse with request rate limits.
-12. **Logging**: Add request logging to stdout or file.
-13. **Configuration File**: Support config file for auth, port, root dir.
-14. **WebSocket Status**: Real-time connection status updates.
-15. **Bulk Operations**: Select multiple files for batch delete/move.
+## Current Status & Known Gaps (Post-v0.3 Evaluation)
+
+The `feat/theia-hls-transcoding` branch successfully delivered the core "H264/AAC button"
+experience. A detailed code review (Grok 4.3, 2026) identified one **critical correctness bug**
+and several robustness/UX gaps. Work is tracked in the following GitHub issues:
+
+- **#3 (P0 — Critical)**: Stale HLS transcode cache on source file replacement / mtime change.
+  The cache must be invalidated when the source changes (add `manifest.json` with mtime/size + probe data).
+- **#8 (P0 — High Impact)**: Major Apple Silicon (M4+) transcoding improvements — hardware decode via `-hwaccel videotoolbox`, improved rate control with headroom (dynamic `-maxrate` + `-bufsize`, `-qmin`/`-qmax`), `-realtime` mode, and optional modern fMP4 (`.m4s`) output. Delivers significantly lower CPU usage and better consistency on M-series Macs.
+- **#4 (P1)**: No limit on concurrent transcodes → resource exhaustion risk on NAS / multi-user.
+- **#5 (P1)**: Transcode errors are opaque (no way to surface `ffmpeg.log` or actionable messages).
+- **#6 (P2 / Architecture)**: Segment-on-demand transcoding for instant arbitrary seeking on long files.
+  **Status: implemented (experimental), MPEG-TS only.** `transcode_mode = "segment"` serves a full VOD
+  playlist up front and transcodes on demand in fixed windows (5 × 6s). Each window seeks with `-ss`,
+  forces a keyframe every 6s, and offsets timestamps (`-output_ts_offset`, `-muxpreload/-muxdelay 0`)
+  so segment N's PTS is exactly `6·N` and independently-transcoded windows stitch together seamlessly
+  (verified: adjacent windows' segments are exactly one frame interval apart). Windows are deduplicated,
+  each holds a concurrency permit only while running (#4), and the next window is prefetched for smooth
+  continuous playback. Remaining: fMP4 (#8) support in this mode, and audio-overlap to remove the small
+  constant sub-frame A/V skew at window boundaries.
+- **#7**: Testing, CI, and docs gaps for the transcoding feature (integration coverage, PR smoke jobs,
+  reproducible verification steps in README).
+
+See the session evaluation plan for the full analysis, repro steps, and recommended implementation order.
+
+## Next Possible Features (Living Roadmap)
+
+### High-Priority Transcoding Evolution
+1. **Apple Silicon (M4+) ffmpeg improvements** (#8): Hardware decode (`-hwaccel videotoolbox`), dynamic rate control with headroom, `-realtime` mode, and optional fMP4 output. One of the highest-impact performance wins on M-series Macs (dramatically lower CPU usage).
+2. **Segment-on-demand transcoding** (see #6): **Implemented (experimental, MPEG-TS only).**
+   `transcode_mode = "segment"` serves a complete VOD playlist upfront and transcodes on demand in
+   fixed windows (5 × 6s); a seek anywhere starts in ~1–2s and re-watched regions are cache hits.
+   - Remaining: fMP4 (#8) in segment mode; audio-overlap to remove the small constant sub-frame
+     A/V skew at window boundaries; tunable window size.
+3. **Cache correctness + manifest** (#3): Lightweight `manifest.json` per cache dir.
+
+### UX Polish
+3. **Transcoded "Play All"**: Switch the folder playlist to per-file HLS so incompatible codecs
+   auto-play in sequence on the iPad (and other limited clients).
+4. **Smart default button**: Use `Probe::ipad_native()` to label the button ("▶ Play" vs "▶ H264/AAC")
+   and choose the default action per file.
+
+### Platform & Operations
+5. **Concurrent transcode limiting + backpressure** (#4): `max_concurrent_transcodes` config + semaphore.
+6. **Better error observability** (#5): Expose `ffmpeg.log` via `/hls/{enc}/ffmpeg.log`, surface useful
+   messages on failure, structured tracing events for session lifecycle.
+7. **Improved cache LRU**: Persisted last-access tracking instead of (or in addition to) filesystem
+   atime/mtime for more reliable eviction of completed transcodes.
+
+### General Features
+8. **File upload / deletion / rename / move**: Write operations with confirmation.
+9. **Search & sorting**: `/search?q=` and sort query params.
+10. **Pagination** for very large directories.
+11. **Rate limiting** and richer structured logging / admin status page.
+12. **Bulk operations**: multi-select batch actions.
+
+See the individual GitHub issues for detailed acceptance criteria and design sketches. The P0 item
+(#3) should be completed before any wider v0.3.x release on real media libraries.
